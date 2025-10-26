@@ -1,5 +1,8 @@
 import os
 import cv2
+
+# Set Gradio temporary directory to current directory's tmp folder
+os.environ['GRADIO_TEMP_DIR'] = './tmp'
 import torch
 import numpy as np
 import gradio as gr
@@ -306,8 +309,8 @@ def run_model(target_dir, model) -> dict:
     del predictions['local_points']
 
     # # transform to first camera coordinate
-    # predictions['points'] = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(predictions['camera_poses'][:, 0]), homogenize_points(predictions['points']))[..., :3]
-    # predictions['camera_poses'] = torch.einsum('bij, bnjk -> bnik', se3_inverse(predictions['camera_poses'][:, 0]), predictions['camera_poses'])
+    predictions['points'] = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(predictions['camera_poses'][:, 0]), homogenize_points(predictions['points']))[..., :3]
+    predictions['camera_poses'] = torch.einsum('bij, bnjk -> bnik', se3_inverse(predictions['camera_poses'][:, 0]), predictions['camera_poses'])
 
     # Convert tensors to numpy
     for key in predictions.keys():

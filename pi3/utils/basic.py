@@ -18,7 +18,7 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     # --- 1. Load image paths or video frames ---
     if osp.isdir(path):
         print(f"Loading images from directory: {path}")
-        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])[::-1]
         for i in range(0, len(filenames), interval):
             img_path = osp.join(path, filenames[i])
             try:

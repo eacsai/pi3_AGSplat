@@ -344,6 +344,61 @@ def opencv_camera_to_plucker(poses, K, H, W):
     return plucker_ray
 
 
+def intrinsics_from_focal_center(fx, fy, cx, cy):
+    """
+    Create camera intrinsic matrix from focal lengths and principal points.
+
+    Args:
+        fx: focal length in x direction
+        fy: focal length in y direction
+        cx: principal point x coordinate
+        cy: principal point y coordinate
+
+    Returns:
+        3x3 camera intrinsic matrix (or batch of matrices if inputs are batched)
+    """
+    if isinstance(fx, torch.Tensor):
+        device = fx.device
+        dtype = fx.dtype
+        # Create batch of intrinsic matrices if inputs are batched
+        batch_shape = fx.shape if fx.dim() > 0 else ()
+
+        # Ensure all inputs have the same batch shape
+        if isinstance(fy, torch.Tensor):
+            fy = fy.to(device=device, dtype=dtype)
+            if fy.shape != batch_shape and fy.dim() > 0:
+                fy = fy.expand(batch_shape)
+        else:
+            fy = torch.full(batch_shape, fy, device=device, dtype=dtype)
+
+        if isinstance(cx, torch.Tensor):
+            cx = cx.to(device=device, dtype=dtype)
+            if cx.shape != batch_shape and cx.dim() > 0:
+                cx = cx.expand(batch_shape)
+        else:
+            cx = torch.full(batch_shape, cx, device=device, dtype=dtype)
+
+        if isinstance(cy, torch.Tensor):
+            cy = cy.to(device=device, dtype=dtype)
+            if cy.shape != batch_shape and cy.dim() > 0:
+                cy = cy.expand(batch_shape)
+        else:
+            cy = torch.full(batch_shape, cy, device=device, dtype=dtype)
+
+        K = torch.zeros(*batch_shape, 3, 3, device=device, dtype=dtype)
+        K[..., 0, 0] = fx
+        K[..., 1, 1] = fy
+        K[..., 0, 2] = cx
+        K[..., 1, 2] = cy
+        K[..., 2, 2] = 1.0
+    else:
+        # Create numpy intrinsic matrix
+        K = np.array([[fx, 0, cx],
+                      [0, fy, cy],
+                      [0, 0, 1]], dtype=np.float32)
+
+    return K
+
 def depth_edge(depth: torch.Tensor, atol: float = None, rtol: float = None, kernel_size: int = 3, mask: torch.Tensor = None) -> torch.BoolTensor:
     """
     Compute the edge mask of a depth map. The edge is defined as the pixels whose neighbors have a large difference in depth.
