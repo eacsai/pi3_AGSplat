@@ -56,6 +56,61 @@ POINT_COLORS = ['red', 'green', 'blue', 'yellow', 'purple', 'cyan', 'orange', 'm
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def world_to_camera_broadcast(pts_all, extrinsics_c2w):
+    """
+    使用广播将世界坐标系点云批量转换到相机坐标系下。
+    
+    参数:
+    pts_all: 世界坐标系点云, 形状 [b, v, N, gpv, 3]
+    extrinsics_c2w: 相机到世界的外参, 形状 [b, 4, 4]
+    
+    返回:
+    pts_cam: 相机坐标系点云, 形状 [b, v, N, gpv, 3]
+    """
+    
+    # 1. 获取 w2c = (c2w)^-1
+    b = pts_all.shape[0]
+    extrinsics_w2c = torch.inverse(extrinsics_c2w)
+
+    # 2. 提取 R (旋转) 和 t (平移)
+    R = extrinsics_w2c[:, :3, :3] # [b, 3, 3]
+    t = extrinsics_w2c[:, :3, 3:4] # [b, 3, 1]
+
+    # 确保数据类型一致
+    R = R.to(pts_all.dtype)
+    t = t.to(pts_all.dtype)
+
+    # 3. 准备 R, t 和 pts_all 以进行广播
+    
+    # 在 R 的 v, N, gpv 维度上添加 '1' 
+    # [b, 3, 3] -> [b, 1, 1, 1, 3, 3]
+    R_expanded = R.view(b, 1, 1, 1, 3, 3)
+    
+    # 在 t 的 v, N, gpv 维度上添加 '1' 
+    # [b, 3, 1] -> [b, 1, 1, 1, 3, 1]
+    t_expanded = t.view(b, 1, 1, 1, 3, 1)
+    
+    # 在 pts_all 的末尾添加一个 '1' 维度，使其成为 "列向量"
+    # [b, v, N, gpv, 3] -> [b, v, N, gpv, 3, 1]
+    pts_vec = pts_all.unsqueeze(-1)
+    
+    # 4. 应用变换: P_cam = R @ P_world + t
+    # matmul 会自动广播 R_expanded 的 [1,1,1] 维度
+    # [b, v, N, gpv, 3, 3] @ [b, v, N, gpv, 3, 1] -> [b, v, N, gpv, 3, 1]
+    pts_rotated_vec = R_expanded @ pts_vec
+    
+    # 广播 t_expanded 并相加
+    # [b, v, N, gpv, 3, 1] + [b, 1, 1, 1, 3, 1] -> [b, v, N, gpv, 3, 1]
+    pts_cam_vec = pts_rotated_vec + t_expanded
+    
+    # 5. 移除最后的 '1' 维度
+    # [b, v, N, gpv, 3, 1] -> [b, v, N, gpv, 3]
+    pts_cam = pts_cam_vec.squeeze(-1)
+    
+    return pts_cam
+
+
+
 def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None,
                            dtype: torch.dtype = None, device: torch.device = None) -> torch.Tensor:
     """
@@ -408,18 +463,25 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     Returns:
         Tuple of (pts_sat, colors_sat, meter_per_pixel)
     """
+    B = single_results['points'].shape[0]
     mask_pts = torch.stack([
-        torch.ones_like(single_grd_mask).to(single_grd_mask.device),
         single_grd_mask,
         single_drone_mask
     ], dim=1)
 
     # Transform to reference camera coordinate system
     reference_cam = single_results['camera_poses'][:, 0]
+    camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), single_results['camera_poses'])
     pts_all = single_results['points']
+
+    mask_pts = F.interpolate(rearrange(mask_pts, 'b v h w c -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
+    mask_pts = rearrange(mask_pts, '(b v) c h w -> b v h w c', b=B)
+    single_img = F.interpolate(rearrange(single_img, 'b v c h w -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
+    single_img = rearrange(single_img, '(b v) c h w -> b v c h w', b=B)
+    pts_all = F.interpolate(rearrange(pts_all, 'b v h w c -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
+    pts_all = rearrange(pts_all, '(b v) c h w -> b v h w c', b=B)
+
     pts_all = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]
-    # pts_all = torch.einsum('ij, bnhwj -> bnhwi', SAT_TO_OPENCV.to(Config.DEVICE).to(pts_all.dtype), homogenize_points(pts_all))[..., :3]
-    pts_all = pts_all * mask_pts
     # Extract satellite points and colors
     pts_sat = pts_all[:, 0:1]
     pts_sat = rearrange(pts_sat, 'b v h w c -> b (v h w) c')
@@ -427,6 +489,18 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     colors_sat = rearrange(colors_sat, 'b v c h w -> b (v h w) c')
     # Extract ground points and colors
     pts_gd = pts_all[:, 1:]
+    ground_cam_pos = camera_poses[:, 1, :3, 3]  # Ground camera is index 1
+    # 构建外参矩阵：单位旋转矩阵 + 指定平移
+    extrinsics = torch.zeros(1, 4, 4, device=pts_gd.device)
+    extrinsics[:, :3, :3] = torch.eye(3, device=pts_gd.device)  # 单位旋转矩阵
+    extrinsics[:, :3, 3] = torch.stack([
+        ground_cam_pos[:, 0],  # x方向平移
+        ground_cam_pos[:, 1],  # y方向平移
+        torch.zeros_like(ground_cam_pos[:, 2])  # z方向平移为0
+    ], dim=1)
+    extrinsics[:, 3, 3] = 1.0  # 齐次坐标
+    pts_gd = world_to_camera_broadcast(pts_gd, extrinsics)
+    pts_gd = pts_gd * mask_pts
     pts_gd = rearrange(pts_gd, 'b v h w c -> b (v h w) c')
     colors_gd = single_img[:, 1:]
     colors_gd = rearrange(colors_gd, 'b v c h w -> b (v h w) c')
@@ -481,7 +555,7 @@ def project_ground_camera_to_satellite(camera_poses: torch.Tensor, intrinsics: t
                 'valid': True,
                 'pixel_x': pixel_x,
                 'pixel_y': pixel_y,
-                'distance': distance * Config.PIXEL_TO_METER
+                'distance': distance * (140 / img_width)  # Scale to real-world distance(140m for 504px)
             })
 
     return projection_info
@@ -687,7 +761,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16):
             # Prepare input images
-            imgs = torch.stack([batch['satellite'], batch['ground'], batch['drone']], dim=1)
+            imgs = torch.stack([batch['sat_pi3'], batch['ground'], batch['drone']], dim=1)
             imgs = imgs.to(Config.DEVICE)
 
             # Run model inference
@@ -697,6 +771,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
             for i in range(batch_size):
                 sample_idx = batch['index'][i].item()
                 grd_gt_angle_degrees = batch['grd_gt_angle_degrees'][i].item()
+                paths = batch['paths']
                 # Extract single sample data
                 single_results, single_img, single_grd_mask, single_drone_mask = extract_single_sample_results(
                     results, imgs, batch, i
@@ -715,20 +790,34 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                 masks = torch.sigmoid(single_results["conf"][:, 0, :, :, 0]) > Config.CONF_THRESHOLD
                 original_height, original_width = points.shape[-3:-1]
                 aspect_ratio = original_width / original_height
+                points = points * masks.float().unsqueeze(-1)
+                width = torch.amax(points[..., 0], dim=(1,2)) - torch.amin(points[..., 0], dim=(1,2))
+                height = torch.amax(points[..., 1], dim=(1,2)) - torch.amin(points[..., 1], dim=(1,2))
 
                 # Recover focal length
                 focal, shift = recover_focal_shift(points, masks)
                 fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
                 intrinsics = intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
 
+                pts_sat = pts_sat.reshape(1, -1, 3)
+                colors_sat = colors_sat.reshape(1, -1, 3)
                 # Get project grd2sat img
-                g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
+                g2s_direct_proj = project_point_clouds(torch.cat((pts_gd, pts_sat), dim=1), torch.cat((colors_gd, colors_sat), dim=1), intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
+                g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
+                g2s_img.save('all2s_proj.png')
+
+                # Get project grd2sat img
+                g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
                 g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
                 g2s_img.save('g2s_proj.png')
 
-                s2s_direct_proj = project_point_clouds(pts_sat.reshape(1, -1, 3), colors_sat.reshape(1, -1, 3), intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
+                s2s_direct_proj = project_point_clouds(pts_sat, colors_sat, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
                 s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu())
                 s2s_img.save('s2s_proj.png')
+
+                sat_ref_img = batch['sat_ref'][i:i+1].to(Config.DEVICE)
+                sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu())
+                sat_ref_img.save('sat_ref.png')
 
                 # Get image dimensions and project ground camera
                 img_width, img_height = imgs[i, 0].shape[-1], imgs[i, 0].shape[-2]
@@ -763,6 +852,21 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                 results_dict['sample_indices'].append(sample_idx)
                 results_dict['projections'].append(projection_info)
                 results_dict['image_sizes'].append((img_width, img_height))
+                
+                grd_camera = {
+                    'pts_gd': pts_gd,  # [1, N, 3]
+                    'intrinsics': intrinsics, # [1, 3, 3]
+                    'width': width, # [1]
+                    'height': height, # [1]
+                }
+                grd_path = paths['ground'][i].split('/')
+                grd_name = grd_path[-1].replace('.jpeg.jpg', '')
+                drone_path = paths['drone'][i].split('/')
+                drone_name = drone_path[-1].replace('.jpeg.jpg', '')
+                save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera.pt')
+                # 如果目录不存在就新建目录
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(grd_camera, save_path)
 
     return results_dict
 
@@ -851,7 +955,7 @@ def main():
 
     # Setup model and data
     model = setup_model()
-    test_dataloader = create_test_dataloader(batch_size=Config.BATCH_SIZE, shuffle=False)
+    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/train_files_1027.txt', batch_size=Config.BATCH_SIZE, shuffle=False)
 
     print(f"Dataset contains {len(test_dataloader.dataset)} samples")
     print(f"Processing {len(test_dataloader)} batches")

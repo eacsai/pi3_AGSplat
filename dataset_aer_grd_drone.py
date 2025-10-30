@@ -29,7 +29,6 @@ SatMap_SIDE = 1024                         # 卫星图输出边长，原始数�
 PIXEL_LIMIT = 255000                       # 255000 pixels limit for resizing images
 # --------------------------------
 satmap_dir = 'satmap'
-
 Default_lat = 49.015
 Satmap_zoom = 18
 SatMap_original_sidelength = 512 # 0.2 m per pixel
@@ -41,6 +40,8 @@ colmap_to_opencv = np.array([
     [1, 0, 0, 0],
     [0, 0, 0, 1]
 ], dtype=np.float32)
+
+Rot = True
 
 def get_meter_per_pixel(lat=Default_lat, zoom=Satmap_zoom, scale=SatMap_process_sidelength/SatMap_original_sidelength):
     meter_per_pixel = 156543.03392 * np.cos(lat * np.pi/180.) / (2**zoom)	
@@ -208,7 +209,12 @@ class TestTripletDataset(Dataset):
             transforms.ToTensor(),
         ])
 
-        self.sat_transform = transforms.Compose([
+        self.sat_transform_ref = transforms.Compose([
+            transforms.Resize(size=[512, 512]),  # SatMap_process_sidelength
+            transforms.ToTensor(),
+        ])
+
+        self.sat_transform_pi3 = transforms.Compose([
             transforms.Resize(size=[self.TARGET_H, self.TARGET_W]),  # SatMap_process_sidelength
             transforms.ToTensor(),
         ])
@@ -235,65 +241,59 @@ class TestTripletDataset(Dataset):
 
         paths = self.file_paths[idx]
 
-        try:
-            # Load images
-            grd_img = Image.open(paths['ground']).convert('RGB')
-            drone_img = Image.open(paths['drone']).convert('RGB')
-            sat_img = Image.open(paths['satellite']).convert('RGB')
-            grd_mask = Image.open(paths['grd_mask']).convert('L')
-            drone_mask = Image.open(paths['drone_mask']).convert('L')
 
-            # Apply 4x downsampling to satellite image (consistent with original dataset)
-            new_size = (750, 750)
-            sat_img = sat_img.resize(new_size, Image.BILINEAR)
+        # Load images
+        grd_img = Image.open(paths['ground']).convert('RGB')
+        drone_img = Image.open(paths['drone']).convert('RGB')
+        sat_img = Image.open(paths['satellite']).convert('RGB')
+        grd_mask = Image.open(paths['grd_mask']).convert('L')
+        drone_mask = Image.open(paths['drone_mask']).convert('L')
 
-            # Apply transforms
-            grd_tensor = self.grd_transform(grd_img)
-            drone_tensor = self.grd_transform(drone_img)
-            sat_tensor = self.sat_transform(sat_img)
-            grd_mask = ~self.mask_transform(grd_mask).bool()
-            grd_tensor = grd_tensor * grd_mask.float()
-            grd_mask = rearrange(grd_mask, '1 h w -> h w 1')
-            drone_mask = ~self.mask_transform(drone_mask).bool()
-            drone_tensor = drone_tensor * drone_mask.float()
-            drone_mask = rearrange(drone_mask, '1 h w -> h w 1')
+        # Load camera parameters
+        npz_path = paths['ground'].replace('.jpeg.jpg', '.jpeg.npz')
+        npz = np.load(npz_path)
+        cam2world = npz['cam2world']
+        cam2world = colmap_to_opencv @ cam2world
+        cam2world = torch.from_numpy(cam2world.astype(np.float32))
+        ground_cam_trans = cam2world[:3, 3]
+        ground_cam_rot = cam2world[:3, :3]
+        grd_angle_radians = torch.atan2(ground_cam_rot[0, 2], ground_cam_rot[2, 2])
+        grd_angle_degrees = torch.rad2deg(grd_angle_radians)
 
-            # Load camera parameters
-            npz_path = paths['ground'].replace('.jpeg.jpg', '.jpeg.npz')
-            npz = np.load(npz_path)
-            cam2world = npz['cam2world']
-            cam2world = colmap_to_opencv @ cam2world
-            cam2world = torch.from_numpy(cam2world.astype(np.float32))
-            ground_cam_trans = cam2world[:3, 3]
-            ground_cam_rot = cam2world[:3, :3]
-            grd_angle_radians = torch.atan2(ground_cam_rot[0, 2], ground_cam_rot[2, 2])
-            grd_angle_degrees = torch.rad2deg(grd_angle_radians)
+        # 对卫星图进行下采样
+        meter_per_pixel = 300 / min(sat_img.size)
+        # sat_img = sat_img.resize(new_size, Image.BILINEAR)
+        if Rot:
+            sat_aligh_cam = sat_img.rotate(grd_angle_degrees)
+            grd_angle_degrees = 0.0 # after rotation, the ground angle is zero
+        else:
+            sat_aligh_cam = sat_img
+        sat_aligh_cam_ref = TF.center_crop(sat_aligh_cam, (210 / meter_per_pixel, 210 / meter_per_pixel))
+        sat_aligh_cam_pi3 = TF.center_crop(sat_aligh_cam, (140 / meter_per_pixel, 140 / meter_per_pixel))
+        # Apply transforms
+        grd_tensor = self.grd_transform(grd_img)
+        drone_tensor = self.grd_transform(drone_img)
+        sat_tensor_ref = self.sat_transform_ref(sat_aligh_cam_ref)
+        sat_tensor_pi3 = self.sat_transform_pi3(sat_aligh_cam_pi3)
+        grd_mask = ~self.mask_transform(grd_mask).bool()
+        grd_tensor = grd_tensor * grd_mask.float()
+        grd_mask = rearrange(grd_mask, '1 h w -> h w 1')
+        drone_mask = ~self.mask_transform(drone_mask).bool()
+        drone_tensor = drone_tensor * drone_mask.float()
+        drone_mask = rearrange(drone_mask, '1 h w -> h w 1')
 
-            return {
-                'ground': grd_tensor,
-                'drone': drone_tensor,
-                'satellite': sat_tensor,
-                'grd_mask': grd_mask,
-                'drone_mask': drone_mask,
-                'grd_gt_angle_degrees': grd_angle_degrees,
-                'paths': paths,
-                'index': idx
-            }
+        return {
+            'ground': grd_tensor,
+            'drone': drone_tensor,
+            'sat_pi3':sat_tensor_pi3,
+            'sat_ref':sat_tensor_ref,
+            'grd_mask': grd_mask,
+            'drone_mask': drone_mask,
+            'grd_gt_angle_degrees': grd_angle_degrees,
+            'paths': paths,
+            'index': idx
+        }
 
-        except Exception as e:
-            print(f"Error loading sample {idx}: {e}")
-            # Return a dummy tensor to avoid breaking the batch
-            dummy_tensor = torch.zeros(3, self.TARGET_H, self.TARGET_W)
-            return {
-                'ground': dummy_tensor,
-                'drone': dummy_tensor,
-                'satellite': dummy_tensor,
-                'grd_mask': torch.zeros(1, self.TARGET_H, self.TARGET_W).bool(),
-                'drone_mask': torch.zeros(1, self.TARGET_H, self.TARGET_W).bool(),
-                'paths': paths,
-                'index': idx,
-                'error': str(e)
-            }
 
     def get_sample_by_index(self, index):
         """
@@ -306,7 +306,7 @@ class TestTripletDataset(Dataset):
         return self.file_paths
 
 
-def create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1024.txt',
+def create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1027.txt',
                           batch_size=1, shuffle=False, num_workers=0,
                           target_size=None, auto_resize=True, **kwargs):
     """
