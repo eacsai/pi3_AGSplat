@@ -863,7 +863,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                 grd_name = grd_path[-1].replace('.jpeg.jpg', '')
                 drone_path = paths['drone'][i].split('/')
                 drone_name = drone_path[-1].replace('.jpeg.jpg', '')
-                save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera.pt')
+                save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera_500.pt')
                 # 如果目录不存在就新建目录
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 torch.save(grd_camera, save_path)
@@ -955,7 +955,7 @@ def main():
 
     # Setup model and data
     model = setup_model()
-    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/train_files_1027.txt', batch_size=Config.BATCH_SIZE, shuffle=False)
+    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/train_files_1029.txt', batch_size=Config.BATCH_SIZE, shuffle=False)
 
     print(f"Dataset contains {len(test_dataloader.dataset)} samples")
     print(f"Processing {len(test_dataloader)} batches")

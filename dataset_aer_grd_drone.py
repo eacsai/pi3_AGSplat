@@ -261,7 +261,7 @@ class TestTripletDataset(Dataset):
         grd_angle_degrees = torch.rad2deg(grd_angle_radians)
 
         # 对卫星图进行下采样
-        meter_per_pixel = 300 / min(sat_img.size)
+        meter_per_pixel = 500 / min(sat_img.size)
         # sat_img = sat_img.resize(new_size, Image.BILINEAR)
         if Rot:
             sat_aligh_cam = sat_img.rotate(grd_angle_degrees)
