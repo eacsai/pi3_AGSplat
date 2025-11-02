@@ -19,7 +19,7 @@ import os
 
 # Local imports
 from pi3.models.pi3 import Pi3
-from dataset_aer_grd_drone import load_test_triplet, create_test_dataloader, TestTripletDataset
+from dataset_aer_grd_drone import load_test_triplet, create_test_dataloader
 from pi3.utils.geometry import intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
 
 
@@ -109,6 +109,71 @@ def world_to_camera_broadcast(pts_all, extrinsics_c2w):
     
     return pts_cam
 
+def rotation_matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    将一个 [3, 3] 旋转矩阵转换为 [w, x, y, z] 四元数。
+    (注意：这个简单实现不支持批处理)
+    """
+    if not matrix.shape == (3, 3):
+        raise ValueError("输入必须是 [3, 3] 矩阵")
+
+    m00, m01, m02 = matrix[0, 0], matrix[0, 1], matrix[0, 2]
+    m10, m11, m12 = matrix[1, 0], matrix[1, 1], matrix[1, 2]
+    m20, m21, m22 = matrix[2, 0], matrix[2, 1], matrix[2, 2]
+
+    trace = m00 + m11 + m22
+    
+    # 使用数值稳定的方法
+    if trace > 0:
+        s = 0.5 / torch.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m21 - m12) * s
+        y = (m02 - m20) * s
+        z = (m10 - m01) * s
+    else:
+        if m00 > m11 and m00 > m22:
+            s = 2.0 * torch.sqrt(1.0 + m00 - m11 - m22)
+            w = (m21 - m12) / s
+            x = 0.25 * s
+            y = (m01 + m10) / s
+            z = (m02 + m20) / s
+        elif m11 > m22:
+            s = 2.0 * torch.sqrt(1.0 + m11 - m00 - m22)
+            w = (m02 - m20) / s
+            x = (m01 + m10) / s
+            y = 0.25 * s
+            z = (m12 + m21) / s
+        else:
+            s = 2.0 * torch.sqrt(1.0 + m22 - m00 - m11)
+            w = (m10 - m01) / s
+            x = (m02 + m20) / s
+            y = (m12 + m21) / s
+            z = 0.25 * s
+            
+    q = torch.stack([w, x, y, z])
+    return q / torch.norm(q) # 归一化
+
+def compare_rotations_manual(R1: torch.Tensor, R2: torch.Tensor) -> torch.Tensor:
+    """
+    使用手动实现的函数比较两个 [3, 3] 旋转矩阵。
+    """
+    # 1. 转换为四元数
+    q1 = rotation_matrix_to_quaternion(R1)
+    q2 = rotation_matrix_to_quaternion(R2)
+    
+    # 2. 计算点积
+    dot_product = torch.dot(q1, q2)
+    
+    # 3. 取绝对值
+    dot_product_abs = torch.abs(dot_product)
+    
+    # 4. 裁剪
+    dot_product_clamped = torch.clamp(dot_product_abs, -1.0, 1.0)
+    
+    # 5. 计算角度
+    angle_rad = 2 * torch.acos(dot_product_clamped)
+    
+    return torch.rad2deg(angle_rad)
 
 
 def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None,
@@ -153,13 +218,35 @@ def solve_optimal_focal_shift(uv: np.ndarray, xyz: np.ndarray) -> Tuple[float, f
     """
     uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
 
+    # Data validation: filter out invalid points
+    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
+    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
+    z_valid = np.isfinite(z)                # Z coordinates must be finite
+    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
+
+    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
+
+    # Apply the mask to filter out invalid points
+    uv = uv[valid_mask]
+    xy = xy[valid_mask]
+    z = z[valid_mask]
+
+    # If not enough valid points, return default values
+    if len(uv) < 2:
+        return 0.0, 1.0
+
     def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
         xy_proj = xy / (z + shift)[:, None]
         f = (xy_proj * uv).sum() / np.square(xy_proj).sum()
         err = (f * xy_proj - uv).ravel()
         return err
 
-    solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
+    try:
+        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
+    except (ValueError, RuntimeError) as e:
+        # If optimization fails, return default values
+        print(f"Warning: Optimization failed ({e}), using default values")
+        return 0.0, 1.0
     optim_shift = solution['x'].squeeze().astype(np.float32)
 
     xy_proj = xy / (z + optim_shift)[:, None]
@@ -182,12 +269,35 @@ def solve_optimal_shift(uv: np.ndarray, xyz: np.ndarray, focal: float) -> float:
     """
     uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
 
+    # Data validation: filter out invalid points
+    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
+    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
+    z_valid = np.isfinite(z)                # Z coordinates must be finite
+    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
+
+    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
+
+    # Apply the mask to filter out invalid points
+    uv = uv[valid_mask]
+    xy = xy[valid_mask]
+    z = z[valid_mask]
+
+    # If not enough valid points, return default value
+    if len(uv) < 2:
+        return 0.0
+
     def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
         xy_proj = xy / (z + shift)[:, None]
         err = (focal * xy_proj - uv).ravel()
         return err
 
-    solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
+    try:
+        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
+    except (ValueError, RuntimeError) as e:
+        # If optimization fails, return default value
+        print(f"Warning: Optimization failed ({e}), using default value")
+        return 0.0
+
     optim_shift = solution['x'].squeeze().astype(np.float32)
 
     return optim_shift
@@ -445,8 +555,11 @@ def extract_single_sample_results(results: Dict, imgs: torch.Tensor, batch: Dict
     single_img = imgs[idx:idx+1]
     single_grd_mask = batch['grd_mask'][idx:idx+1].to(Config.DEVICE).float()
     single_drone_mask = batch['drone_mask'][idx:idx+1].to(Config.DEVICE).float()
+    grd_rot = batch['grd_rot'][idx].to(Config.DEVICE).float()
+    grd_shift_z = batch['grd_shift_z'][idx:idx+1].to(Config.DEVICE).float().item()
+    grd_shift_x = batch['grd_shift_x'][idx:idx+1].to(Config.DEVICE).float().item()
 
-    return single_results, single_img, single_grd_mask, single_drone_mask
+    return single_results, single_img, single_grd_mask, single_drone_mask, grd_rot, grd_shift_z, grd_shift_x
 
 
 def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
@@ -465,6 +578,7 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     """
     B = single_results['points'].shape[0]
     mask_pts = torch.stack([
+        torch.ones_like(single_grd_mask, device=Config.DEVICE),
         single_grd_mask,
         single_drone_mask
     ], dim=1)
@@ -473,6 +587,28 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     reference_cam = single_results['camera_poses'][:, 0]
     camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), single_results['camera_poses'])
     pts_all = single_results['points']
+    pts_all = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]
+
+    conf_all = single_results['conf']
+    # Set xyz coordinates to zero for points with confidence in bottom 20%
+    # Flatten confidence values to find threshold
+    conf_flat = conf_all.view(conf_all.shape[0], -1)  # (B, N)
+    conf_threshold = torch.quantile(conf_flat, 0.3, dim=1, keepdim=True)  # Find 30th percentile for each batch
+
+    # Create mask for points with confidence below threshold (bottom 20%)
+    conf_mask = conf_all >= conf_threshold.view(-1, 1, 1, 1, 1)  # (B, V, H, W, 1)
+
+    # Apply mask to point coordinates - set xyz to zero for low confidence points
+    pts_all = pts_all * conf_mask.float() * mask_pts.float()
+
+    # Normalize point cloud
+    dis_all = torch.norm(pts_all, dim=-1).reshape(B, -1)
+    norm_factor = dis_all.sum(dim=[-1]) / ((conf_mask.float() * mask_pts.float()).reshape(B, -1).sum(dim=[-1]) + 1e-5) # [B]
+    
+    pts_all = pts_all / (norm_factor.view(B, 1, 1, 1, 1) + 1e-5)
+    camera_poses[:, :, :3, 3] = camera_poses[:, :, :3, 3] / (norm_factor.view(B, 1, 1) + 1e-5)
+    
+    single_results['camera_poses'] = camera_poses
 
     mask_pts = F.interpolate(rearrange(mask_pts, 'b v h w c -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
     mask_pts = rearrange(mask_pts, '(b v) c h w -> b v h w c', b=B)
@@ -481,7 +617,6 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     pts_all = F.interpolate(rearrange(pts_all, 'b v h w c -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
     pts_all = rearrange(pts_all, '(b v) c h w -> b v h w c', b=B)
 
-    pts_all = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]
     # Extract satellite points and colors
     pts_sat = pts_all[:, 0:1]
     pts_sat = rearrange(pts_sat, 'b v h w c -> b (v h w) c')
@@ -500,7 +635,7 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     ], dim=1)
     extrinsics[:, 3, 3] = 1.0  # 齐次坐标
     pts_gd = world_to_camera_broadcast(pts_gd, extrinsics)
-    pts_gd = pts_gd * mask_pts
+    pts_gd = pts_gd * mask_pts[:, 1:]
     pts_gd = rearrange(pts_gd, 'b v h w c -> b (v h w) c')
     colors_gd = single_img[:, 1:]
     colors_gd = rearrange(colors_gd, 'b v c h w -> b (v h w) c')
@@ -512,8 +647,15 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     return pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel
 
 
-def project_ground_camera_to_satellite(camera_poses: torch.Tensor, intrinsics: torch.Tensor,
-                                     img_width: int, img_height: int) -> Dict[str, Any]:
+def project_ground_camera_to_satellite(camera_poses: torch.Tensor, 
+                                       intrinsics: torch.Tensor,
+                                       img_width: int, 
+                                       img_height: int,
+                                       grd_rot: torch.Tensor,
+                                       grd_angle_degrees: float,
+                                       grd_shift_z: float,
+                                       grd_shift_x: float
+                                    ) -> Dict[str, Any]:
     """
     Project ground camera position to satellite view coordinates.
 
@@ -522,23 +664,35 @@ def project_ground_camera_to_satellite(camera_poses: torch.Tensor, intrinsics: t
         intrinsics: Camera intrinsics matrix
         img_width: Image width
         img_height: Image height
+        grd_rot: Ground camera rotation matrix
+        grd_angle_degrees: Ground camera angle in degrees
+        grd_shift_z: Ground camera shift in z direction
+        grd_shift_x: Ground camera shift in x direction
 
     Returns:
         Dictionary containing projection information
     """
     center_x, center_y = img_width // 2, img_height // 2
     K = intrinsics if intrinsics.dim() == 2 else intrinsics[0]
+    grd_camera = SAT_TO_OPENCV.to(camera_poses.device) @ camera_poses[0, 1]
     ground_cam_pos = camera_poses[0, 1, :3, 3]  # Ground camera is index 1
-    ground_cam_rot = camera_poses[0, 1, :3, :3]
-    ground_angle_radians = torch.atan2(ground_cam_rot[1, 2], ground_cam_rot[0, 2])
+    ground_cam_rot = grd_camera[:3, :3]
+    ground_angle_radians = torch.atan2(ground_cam_rot[0, 2], ground_cam_rot[2, 2])
     ground_angle_degrees = torch.rad2deg(ground_angle_radians)
 
+    delta_grd_rot = compare_rotations_manual(ground_cam_rot, grd_rot)
+
+    meter_per_pixel = 140.0 / img_width  # 140m for 504px
     projection_info = {
         'valid': False,
+        'delta_x': None,
+        'delta_y': None,
         'pixel_x': None,
         'pixel_y': None,
         'distance': None,
-        'ground_angle_degrees': ground_angle_degrees.item()
+        'delta_grd_rot': delta_grd_rot.item(),
+        'grd_angle_degrees': ground_angle_degrees.item(),
+        'delta_grd_angle': np.abs(ground_angle_degrees.item() - grd_angle_degrees)
     }
 
     # Project ground camera to satellite view
@@ -549,16 +703,21 @@ def project_ground_camera_to_satellite(camera_poses: torch.Tensor, intrinsics: t
         pixel_x = int(x_norm * img_width)
         pixel_y = int(y_norm * img_height)
 
+        meter_x = (pixel_x - center_x) * meter_per_pixel
+        meter_y = (pixel_y - center_y) * meter_per_pixel
+
         if 0 <= pixel_x < img_width and 0 <= pixel_y < img_height:
-            distance = np.sqrt((pixel_x - center_x)**2 + (pixel_y - center_y)**2)
+            distance = np.sqrt((meter_x - grd_shift_z)**2 + (meter_y - grd_shift_x)**2)
             projection_info.update({
                 'valid': True,
+                'delta_x': np.abs(meter_x - grd_shift_z),
+                'delta_y': np.abs(meter_y - grd_shift_x),
                 'pixel_x': pixel_x,
                 'pixel_y': pixel_y,
-                'distance': distance * (140 / img_width)  # Scale to real-world distance(140m for 504px)
+                'distance': distance  # Scale to real-world distance(140m for 504px)
             })
 
-    return projection_info
+    return projection_info, meter_per_pixel
 
 
 def save_debug_images(single_img: torch.Tensor, pts_sat: torch.Tensor, colors_sat: torch.Tensor,
@@ -755,118 +914,120 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
         'distances': [],
         'sample_indices': [],
         'projections': [],
-        'image_sizes': []
+        'image_sizes': [],
+        'delta_grd_angle': [],
+        'delta_grd_rot': [],
+        'delta_shift_z': [],
+        'delta_shift_x': []
     }
 
     with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16):
-            # Prepare input images
-            imgs = torch.stack([batch['sat_pi3'], batch['ground'], batch['drone']], dim=1)
-            imgs = imgs.to(Config.DEVICE)
+        # Prepare input images
+        imgs = torch.stack([batch['sat_pi3'], batch['ground'], batch['drone']], dim=1)
+        imgs = imgs.to(Config.DEVICE)
 
-            # Run model inference
-            results = model(imgs)
+        # Run model inference
+        results = model(imgs)
 
-            # Process each sample in the batch
-            for i in range(batch_size):
-                sample_idx = batch['index'][i].item()
-                grd_gt_angle_degrees = batch['grd_gt_angle_degrees'][i].item()
-                paths = batch['paths']
-                # Extract single sample data
-                single_results, single_img, single_grd_mask, single_drone_mask = extract_single_sample_results(
-                    results, imgs, batch, i
+        # Process each sample in the batch
+        for i in range(batch_size):
+            sample_idx = batch['index'][i].item()
+            grd_gt_angle_degrees = batch['grd_gt_angle_degrees'][i].item()
+            paths = batch['paths']
+            # Extract single sample data
+            single_results, single_img, single_grd_mask, single_drone_mask, grd_rot, grd_shift_z, grd_shift_x = extract_single_sample_results(
+                results, imgs, batch, i
+            )
+
+            # Reconstruct point cloud
+            pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel = reconstruct_point_cloud(
+                single_results, single_img, single_grd_mask, single_drone_mask
+            )
+
+            # Save debug images (optional)
+            save_debug_images(single_img, pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel)
+
+            # Recover intrinsics from local points
+            points = pts_sat.reshape(1, 128, 128, 3)
+            original_height, original_width = points.shape[-3:-1]
+            aspect_ratio = original_width / original_height
+            width = torch.amax(points[..., 0], dim=(1,2)) - torch.amin(points[..., 0], dim=(1,2))
+            height = torch.amax(points[..., 1], dim=(1,2)) - torch.amin(points[..., 1], dim=(1,2))
+
+            # Recover focal length
+            focal, shift = recover_focal_shift(points)
+            fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+            intrinsics = intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+
+            pts_sat = pts_sat.reshape(1, -1, 3)
+            colors_sat = colors_sat.reshape(1, -1, 3)
+            # Get project grd2sat img
+            g2s_direct_proj = project_point_clouds(torch.cat((pts_gd, pts_sat), dim=1), torch.cat((colors_gd, colors_sat), dim=1), intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
+            g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
+            g2s_img.save('all2s_proj.png')
+
+            # Get project grd2sat img
+            g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
+            g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
+            g2s_img.save('g2s_proj.png')
+
+            s2s_direct_proj = project_point_clouds(pts_sat, colors_sat, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
+            s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu())
+            s2s_img.save('s2s_proj.png')
+
+            sat_ref_img = batch['sat_ref'][i:i+1].to(Config.DEVICE)
+            sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu())
+            sat_ref_img.save('sat_ref.png')
+
+            # Get image dimensions and project ground camera
+            img_width, img_height = imgs[i, 0].shape[-1], imgs[i, 0].shape[-2]
+            projection_info, meter_per_pixel = project_ground_camera_to_satellite(
+                single_results['camera_poses'], intrinsics, img_width, img_height, grd_rot, grd_gt_angle_degrees, grd_shift_z, grd_shift_x
+            )
+
+            # Create coordinate visualization if projection is valid
+            if projection_info['valid']:
+                center_x, center_y = img_width // 2, img_height // 2
+                pixel_x = projection_info['pixel_x']
+                pixel_y = projection_info['pixel_y']
+
+                # Call visualization function
+                visualize_coordinates_on_satellite(
+                    imgs[i, 0],
+                    pixel_x=pixel_x,
+                    pixel_y=pixel_y,
+                    center_x=center_x + grd_shift_z / meter_per_pixel,
+                    center_y=center_y + grd_shift_x / meter_per_pixel,
+                    ground_angle_pred=projection_info['grd_angle_degrees'],
+                    ground_angle_gt=grd_gt_angle_degrees,
+                    sample_idx=sample_idx,
+                    save_dir=f"coordinate_visualizations/sat_pred_{len(results_dict['distances'])}.png"
                 )
 
-                # Reconstruct point cloud
-                pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel = reconstruct_point_cloud(
-                    single_results, single_img, single_grd_mask, single_drone_mask
-                )
-
-                # Save debug images (optional)
-                save_debug_images(single_img, pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel)
-
-                # Recover intrinsics from local points
-                points = single_results["local_points"][:, 0]
-                masks = torch.sigmoid(single_results["conf"][:, 0, :, :, 0]) > Config.CONF_THRESHOLD
-                original_height, original_width = points.shape[-3:-1]
-                aspect_ratio = original_width / original_height
-                points = points * masks.float().unsqueeze(-1)
-                width = torch.amax(points[..., 0], dim=(1,2)) - torch.amin(points[..., 0], dim=(1,2))
-                height = torch.amax(points[..., 1], dim=(1,2)) - torch.amin(points[..., 1], dim=(1,2))
-
-                # Recover focal length
-                focal, shift = recover_focal_shift(points, masks)
-                fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
-                intrinsics = intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
-
-                pts_sat = pts_sat.reshape(1, -1, 3)
-                colors_sat = colors_sat.reshape(1, -1, 3)
-                # Get project grd2sat img
-                g2s_direct_proj = project_point_clouds(torch.cat((pts_gd, pts_sat), dim=1), torch.cat((colors_gd, colors_sat), dim=1), intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
-                g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
-                g2s_img.save('all2s_proj.png')
-
-                # Get project grd2sat img
-                g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
-                g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
-                g2s_img.save('g2s_proj.png')
-
-                s2s_direct_proj = project_point_clouds(pts_sat, colors_sat, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
-                s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu())
-                s2s_img.save('s2s_proj.png')
-
-                sat_ref_img = batch['sat_ref'][i:i+1].to(Config.DEVICE)
-                sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu())
-                sat_ref_img.save('sat_ref.png')
-
-                # Get image dimensions and project ground camera
-                img_width, img_height = imgs[i, 0].shape[-1], imgs[i, 0].shape[-2]
-                reference_cam = single_results['camera_poses'][:, 0]
-                camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), single_results['camera_poses'])
-
-                projection_info = project_ground_camera_to_satellite(
-                    camera_poses, intrinsics, img_width, img_height
-                )
-
-                # Create coordinate visualization if projection is valid
-                if projection_info['valid']:
-                    center_x, center_y = img_width // 2, img_height // 2
-                    pixel_x = projection_info['pixel_x']
-                    pixel_y = projection_info['pixel_y']
-
-                    # Call visualization function
-                    visualize_coordinates_on_satellite(
-                        imgs[i, 0],
-                        pixel_x=pixel_x,
-                        pixel_y=pixel_y,
-                        center_x=center_x,
-                        center_y=center_y,
-                        ground_angle_pred=projection_info['ground_angle_degrees'],
-                        ground_angle_gt=grd_gt_angle_degrees,
-                        sample_idx=sample_idx,
-                        save_dir=f"coordinate_visualizations/sat_pred_{len(results_dict['distances'])}.png"
-                    )
-
-                # Store results
-                results_dict['distances'].append(projection_info['distance'])
-                results_dict['sample_indices'].append(sample_idx)
-                results_dict['projections'].append(projection_info)
-                results_dict['image_sizes'].append((img_width, img_height))
-                
-                grd_camera = {
-                    'pts_gd': pts_gd,  # [1, N, 3]
-                    'intrinsics': intrinsics, # [1, 3, 3]
-                    'width': width, # [1]
-                    'height': height, # [1]
-                }
-                grd_path = paths['ground'][i].split('/')
-                grd_name = grd_path[-1].replace('.jpeg.jpg', '')
-                drone_path = paths['drone'][i].split('/')
-                drone_name = drone_path[-1].replace('.jpeg.jpg', '')
-                save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera_500.pt')
-                # 如果目录不存在就新建目录
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                torch.save(grd_camera, save_path)
+            # Store results
+            results_dict['distances'].append(projection_info['distance'])
+            results_dict['delta_grd_angle'].append(projection_info['delta_grd_angle'])
+            results_dict['delta_grd_rot'].append(projection_info['delta_grd_rot'])
+            results_dict['delta_shift_z'].append(projection_info['delta_x'])
+            results_dict['delta_shift_x'].append(projection_info['delta_y'])
+            results_dict['sample_indices'].append(sample_idx)
+            results_dict['projections'].append(projection_info)
+            results_dict['image_sizes'].append((img_width, img_height))
+            
+            grd_camera = {
+                'pts_gd': pts_gd,  # [1, N, 3]
+                'intrinsics': intrinsics, # [1, 3, 3]
+                'width': width, # [1]
+                'height': height, # [1]
+            }
+            grd_path = paths['ground'][i].split('/')
+            grd_name = grd_path[-1].replace('.jpeg.jpg', '')
+            drone_path = paths['drone'][i].split('/')
+            drone_name = drone_path[-1].replace('.jpeg.jpg', '')
+            save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera_500.pt')
+            # 如果目录不存在就新建目录
+            # os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            # torch.save(grd_camera, save_path)
 
     return results_dict
 
@@ -875,7 +1036,12 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
 # STATISTICS AND OUTPUT FUNCTIONS
 # =============================================================================
 
-def calculate_statistics(distances: List[float]) -> Dict[str, float]:
+def calculate_statistics(distances: List[float],
+                         delta_grd_angle: List[float],
+                         delta_grd_rot: List[float],
+                         delta_shift_z: List[float],
+                         delta_shift_x: List[float]
+                         ) -> Dict[str, float]:
     """
     Calculate statistical measures for distances.
 
@@ -886,11 +1052,17 @@ def calculate_statistics(distances: List[float]) -> Dict[str, float]:
         Dictionary containing statistics
     """
     return {
-        'mean': np.mean(distances),
-        'std': np.std(distances),
-        'min': np.min(distances),
-        'max': np.max(distances),
-        'median': np.median(distances)
+        'dis_mean': np.mean(distances),
+        'dis_std': np.std(distances),
+        'dis_min': np.min(distances),
+        'dis_max': np.max(distances),
+        'dis_median': np.median(distances),
+        'delta_grd_rot': np.mean(delta_grd_rot),
+        'delta_grd_angle': np.mean(delta_grd_angle),
+        'delta_shift_z': delta_shift_z,
+        'delta_shift_z_mean': np.mean(delta_shift_z),
+        'delta_shift_x': delta_shift_x,
+        'delta_shift_x_mean': np.mean(delta_shift_x),
     }
 
 
@@ -915,10 +1087,26 @@ def save_results_to_file(all_distances: List[float], all_sample_indices: List[in
         f.write(f"Valid projections: {valid_projections_count}\n")
         f.write(f"Success rate: {100*valid_projections_count/total_samples:.2f}%\n\n")
         f.write(f"Distance Statistics (pixels):\n")
-        f.write(f"  Mean: {stats['mean']:.2f} ± {stats['std']:.2f}\n")
-        f.write(f"  Median: {stats['median']:.2f}\n")
-        f.write(f"  Min: {stats['min']:.2f}\n")
-        f.write(f"  Max: {stats['max']:.2f}\n\n")
+        f.write(f"  Mean: {stats['dis_mean']:.2f} ± {stats['dis_std']:.2f}\n")
+        f.write(f"  Median: {stats['dis_median']:.2f}\n")
+        f.write(f"  Min: {stats['dis_min']:.2f}\n")
+        f.write(f"  Max: {stats['dis_max']:.2f}\n\n")
+        f.write(f"  Heading Differences (degrees): {stats['delta_grd_angle']:.2f}\n")
+        f.write(f"  Ground Camera Rot Differences (degrees): {stats['delta_grd_rot']:.2f}\n")
+        f.write(f"Delta Shift Z (meters): {stats['delta_shift_z_mean']:.2f}\n")
+        f.write(f"Delta Shift X (meters): {stats['delta_shift_x_mean']:.2f}\n\n")
+        metrics = [1, 3, 5]
+        f.write("Lateral Accuracy:\n")
+        for threshold in metrics:
+            pred_acc = np.sum(np.array(stats['delta_shift_z']) < threshold) / len(stats['delta_shift_z']) * 100
+            line = f'  Distance within {threshold}m: {pred_acc:.2f}% (pred)\n'
+            f.write(line)
+        f.write("\nLongitudinal Accuracy:\n")
+        for threshold in metrics:
+            pred_acc = np.sum(np.array(stats['delta_shift_x']) < threshold) / len(stats['delta_shift_x']) * 100
+            line = f'  Distance within {threshold}m: {pred_acc:.2f}% (pred)\n'
+            f.write(line)
+        f.write("\n")
         f.write("Individual Results:\n")
         for idx, dist in zip(all_sample_indices, all_distances):
             f.write(f"  Sample {idx}: {dist:.2f} pixels\n")
@@ -939,10 +1127,28 @@ def print_statistics(stats: Dict[str, float], total_samples: int, valid_projecti
     print(f"Invalid projections: {total_samples - valid_projections_count}")
     print(f"Success rate: {100*valid_projections_count/total_samples:.2f}%")
     print(f"\nGround camera to satellite center distances (pixels):")
-    print(f"  Mean: {stats['mean']:.2f} ± {stats['std']:.2f}")
-    print(f"  Median: {stats['median']:.2f}")
-    print(f"  Min: {stats['min']:.2f}")
-    print(f"  Max: {stats['max']:.2f}")
+    print(f"  Mean: {stats['dis_mean']:.2f} ± {stats['dis_std']:.2f}")
+    print(f"  Median: {stats['dis_median']:.2f}")
+    print(f"  Min: {stats['dis_min']:.2f}")
+    print(f"  Max: {stats['dis_max']:.2f}")
+    print(f"  Heading Differences (degrees): {stats['delta_grd_angle']:.2f}")
+    print(f"  Ground Camera Rot Differences (degrees): {stats['delta_grd_rot']:.2f}")
+    print(f"\nDelta Shift Z (meters): {stats['delta_shift_z_mean']:.2f}")
+    print(f"Delta Shift X (meters): {stats['delta_shift_x_mean']:.2f}")
+    metrics = [1, 3, 5]
+    # Lateral accuracy
+    delta_shift_z = np.array(stats['delta_shift_z']) if isinstance(stats['delta_shift_z'], list) else stats['delta_shift_z']
+    for threshold in metrics:
+        pred_acc = np.sum(delta_shift_z < threshold) / len(delta_shift_z) * 100
+        line = f'Lateral distance within {threshold}m: {pred_acc:.2f}% (pred)\n'
+        print(line, end='')
+
+    # Longitudinal accuracy
+    delta_shift_x = np.array(stats['delta_shift_x']) if isinstance(stats['delta_shift_x'], list) else stats['delta_shift_x']
+    for threshold in metrics:
+        pred_acc = np.sum(delta_shift_x < threshold) / len(delta_shift_x) * 100
+        line = f'Longitudinal distance within {threshold}m: {pred_acc:.2f}% (pred)\n'
+        print(line, end='')
 
 
 # =============================================================================
@@ -955,13 +1161,17 @@ def main():
 
     # Setup model and data
     model = setup_model()
-    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/train_files_1029.txt', batch_size=Config.BATCH_SIZE, shuffle=False)
+    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1029.txt', batch_size=Config.BATCH_SIZE, shuffle=False, amount=1.0)
 
     print(f"Dataset contains {len(test_dataloader.dataset)} samples")
     print(f"Processing {len(test_dataloader)} batches")
 
     # Collect all results
     all_distances = []
+    all_grd_angle = []
+    all_grd_rot = []
+    all_delta_shift_z = []
+    all_delta_shift_x = []
     all_sample_indices = []
     valid_projections_count = 0
     total_samples = 0
@@ -975,14 +1185,24 @@ def main():
         batch_results = calculate_ground_camera_distance(batch, model)
 
         # Collect results
-        for i, (dist, idx, proj) in enumerate(zip(batch_results['distances'],
-                                                  batch_results['sample_indices'],
-                                                  batch_results['projections'])):
+        for i, (dist, delta_grd_angle, delta_grd_rot, delta_shift_z, delta_shift_x, idx, proj) in enumerate(
+            zip(batch_results['distances'],
+                batch_results['delta_grd_angle'],
+                batch_results['delta_grd_rot'],
+                batch_results['delta_shift_z'],
+                batch_results['delta_shift_x'],
+                batch_results['sample_indices'],
+                batch_results['projections']
+            )):
             total_samples += 1
             all_sample_indices.append(idx)
 
             if proj['valid']:
                 all_distances.append(dist)
+                all_grd_angle.append(delta_grd_angle)
+                all_grd_rot.append(delta_grd_rot)
+                all_delta_shift_z.append(delta_shift_z)
+                all_delta_shift_x.append(delta_shift_x)
                 valid_projections_count += 1
 
         # Memory cleanup
@@ -993,7 +1213,7 @@ def main():
 
     # Calculate and display statistics
     if all_distances:
-        stats = calculate_statistics(all_distances)
+        stats = calculate_statistics(all_distances, all_grd_angle, all_grd_rot, all_delta_shift_z, all_delta_shift_x)
         print_statistics(stats, total_samples, valid_projections_count)
         save_results_to_file(all_distances, all_sample_indices, total_samples, valid_projections_count, stats)
         print(f"\n💾 Results saved to {Config.OUTPUT_FILE}")

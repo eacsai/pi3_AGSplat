@@ -41,7 +41,7 @@ colmap_to_opencv = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float32)
 
-Rot = True
+Rot = False
 
 def get_meter_per_pixel(lat=Default_lat, zoom=Satmap_zoom, scale=SatMap_process_sidelength/SatMap_original_sidelength):
     meter_per_pixel = 156543.03392 * np.cos(lat * np.pi/180.) / (2**zoom)	
@@ -140,7 +140,7 @@ class TestTripletDataset(Dataset):
     """
 
     def __init__(self, test_file_path='/data/zhongyao/aer-grd-map/test_files_1024.txt',
-                 target_size=None, auto_resize=True):
+                 target_size=None, auto_resize=True, amount=1.0):
         """
         Args:
             test_file_path (str): Path to the test file list
@@ -149,13 +149,18 @@ class TestTripletDataset(Dataset):
         """
         self.test_file_path = test_file_path
         self.auto_resize = auto_resize
-
+        self.stage = self.test_file_path.split('/')[-1].split('_')[0]
         # Load test file list
         with open(test_file_path, 'r') as f:
             self.lines = f.readlines()
 
         # Remove empty lines and strip whitespace
         self.lines = [line.strip() for line in self.lines if line.strip()]
+
+        # Select only a fraction of the data
+        total_samples = len(self.lines)
+        num_selected = max(1, int(total_samples * amount))  # Ensure at least 1 sample
+        self.lines = self.lines[:num_selected]  # Take first fraction
 
         print(f"Loaded {len(self.lines)} test samples from {test_file_path}")
 
@@ -165,13 +170,24 @@ class TestTripletDataset(Dataset):
             test_line = line.split(' ')
             if len(test_line) >= 5:
                 grd_path, drone_path, sat_path, grd_mask, drone_mask = test_line[0], test_line[1], test_line[2], test_line[3], test_line[4]
-                self.file_paths.append({
-                    'ground': grd_path,
-                    'drone': drone_path,
-                    'satellite': sat_path,
-                    'grd_mask': grd_mask,
-                    'drone_mask': drone_mask
-                })
+                if self.stage == 'test':
+                    self.file_paths.append({
+                        'ground': grd_path,
+                        'drone': drone_path,
+                        'satellite': sat_path,
+                        'grd_mask': grd_mask,
+                        'drone_mask': drone_mask,
+                        'gt_shift_x': float(test_line[5]),
+                        'gt_shift_y': float(test_line[6]),
+                    })
+                else:
+                    self.file_paths.append({
+                        'ground': grd_path,
+                        'drone': drone_path,
+                        'satellite': sat_path,
+                        'grd_mask': grd_mask,
+                        'drone_mask': drone_mask,
+                    })
 
         # Calculate target size if not provided
         if target_size is None and auto_resize:
@@ -257,6 +273,7 @@ class TestTripletDataset(Dataset):
         cam2world = torch.from_numpy(cam2world.astype(np.float32))
         ground_cam_trans = cam2world[:3, 3]
         ground_cam_rot = cam2world[:3, :3]
+        # 计算地面相机的朝向角度
         grd_angle_radians = torch.atan2(ground_cam_rot[0, 2], ground_cam_rot[2, 2])
         grd_angle_degrees = torch.rad2deg(grd_angle_radians)
 
@@ -265,9 +282,21 @@ class TestTripletDataset(Dataset):
         # sat_img = sat_img.resize(new_size, Image.BILINEAR)
         if Rot:
             sat_aligh_cam = sat_img.rotate(grd_angle_degrees)
+            gt_shift_x = 0.0
+            gt_shift_y = 0.0
             grd_angle_degrees = 0.0 # after rotation, the ground angle is zero
         else:
             sat_aligh_cam = sat_img
+        
+        if self.stage == 'test' and Rot is False:
+            gt_shift_x, gt_shift_y = paths['gt_shift_x'], paths['gt_shift_y']
+            dx_p = gt_shift_x * 20.0 / meter_per_pixel
+            dy_p = gt_shift_y * 20.0 / meter_per_pixel
+            sat_aligh_cam = sat_aligh_cam.transform(
+                sat_aligh_cam.size, Image.AFFINE,
+                (1, 0, dx_p, 0, 1, -dy_p), resample=Image.BILINEAR
+            )
+
         sat_aligh_cam_ref = TF.center_crop(sat_aligh_cam, (210 / meter_per_pixel, 210 / meter_per_pixel))
         sat_aligh_cam_pi3 = TF.center_crop(sat_aligh_cam, (140 / meter_per_pixel, 140 / meter_per_pixel))
         # Apply transforms
@@ -290,6 +319,9 @@ class TestTripletDataset(Dataset):
             'grd_mask': grd_mask,
             'drone_mask': drone_mask,
             'grd_gt_angle_degrees': grd_angle_degrees,
+            'grd_rot': ground_cam_rot,
+            'grd_shift_z': -gt_shift_x * 20.0, # m
+            'grd_shift_x': gt_shift_y * 20.0, # m
             'paths': paths,
             'index': idx
         }
@@ -308,7 +340,7 @@ class TestTripletDataset(Dataset):
 
 def create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1027.txt',
                           batch_size=1, shuffle=False, num_workers=0,
-                          target_size=None, auto_resize=True, **kwargs):
+                          target_size=None, auto_resize=True, amount=1.0, **kwargs):
     """
     Create a DataLoader for test triplet dataset
 
@@ -327,7 +359,8 @@ def create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files
     dataset = TestTripletDataset(
         test_file_path=test_file_path,
         target_size=target_size,
-        auto_resize=auto_resize
+        auto_resize=auto_resize,
+        amount=amount
     )
 
     dataloader = torch.utils.data.DataLoader(
