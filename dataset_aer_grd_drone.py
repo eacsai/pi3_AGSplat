@@ -41,7 +41,7 @@ colmap_to_opencv = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float32)
 
-Rot = False
+Rot = False # True是方向对齐，False是不对齐  
 
 def get_meter_per_pixel(lat=Default_lat, zoom=Satmap_zoom, scale=SatMap_process_sidelength/SatMap_original_sidelength):
     meter_per_pixel = 156543.03392 * np.cos(lat * np.pi/180.) / (2**zoom)	
@@ -190,12 +190,7 @@ class TestTripletDataset(Dataset):
                     })
 
         # Calculate target size if not provided
-        if target_size is None and auto_resize:
-            self.TARGET_W, self.TARGET_H = self._calculate_target_size()
-        elif target_size is not None:
-            self.TARGET_W, self.TARGET_H = target_size
-        else:
-            self.TARGET_W, self.TARGET_H = 512, 512  # default size
+        self.TARGET_W, self.TARGET_H = 504, 504  # default size
 
         print(f"Images will be resized to uniform size: ({self.TARGET_W}, {self.TARGET_H})")
 
@@ -316,6 +311,7 @@ class TestTripletDataset(Dataset):
             'drone': drone_tensor,
             'sat_pi3':sat_tensor_pi3,
             'sat_ref':sat_tensor_ref,
+            'sat_mask': torch.ones_like(grd_mask, dtype=torch.float32), # placeholder
             'grd_mask': grd_mask,
             'drone_mask': drone_mask,
             'grd_gt_angle_degrees': grd_angle_degrees,

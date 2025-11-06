@@ -5,7 +5,7 @@ This script processes satellite, ground, and drone image triplets to calculate
 the distance from ground camera positions to satellite image centers.
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # 指定使用的GPU设备ID
 
 import torch
 import torch.nn.functional as F
@@ -17,14 +17,14 @@ from typing import Tuple, Optional, Dict, List, Any
 from functools import partial
 from scipy.optimize import least_squares
 from einops import einsum, rearrange, repeat
-
+from image_pairs import make_pairs
 
 # Local imports
 from pi3.models.pi3 import Pi3
 from dataset_aer_grd_drone import load_test_triplet, create_test_dataloader
 from pi3.utils.geometry import intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
 
-
+from cloud_opt import global_aligner, GlobalAlignerMode
 # =============================================================================
 # CONFIGURATION AND CONSTANTS
 # =============================================================================
@@ -57,6 +57,113 @@ POINT_COLORS = ['red', 'green', 'blue', 'yellow', 'purple', 'cyan', 'orange', 'm
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+
+def save_points_to_ply(points: torch.Tensor, colors: torch.Tensor, filename: str):
+    """
+    Save points and colors to a PLY file.
+
+    Args:
+        points: Tensor of shape (N, 3) containing 3D coordinates
+        colors: Tensor of shape (N, 3) containing RGB colors in [0, 1] range
+        filename: Output PLY filename
+    """
+    # Convert to numpy
+    points_np = points.detach().cpu().numpy()
+    colors_np = (colors.detach().cpu().numpy() * 255).astype(np.uint8)
+
+    # Filter valid points (where z > 0 to avoid ground plane points)
+    valid_mask = points_np[:, 2] > 0.1  # Filter out ground plane points
+    valid_points = points_np[valid_mask]
+    valid_colors = colors_np[valid_mask]
+
+    if len(valid_points) == 0:
+        print(f"Warning: No valid points to save for {filename}")
+        return
+
+    # Create PLY content
+    ply_content = f"""ply
+        format ascii 1.0
+        element vertex {len(valid_points)}
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+    """
+
+    # Add vertex data
+    for point, color in zip(valid_points, valid_colors):
+        ply_content += f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} {color[0]} {color[1]} {color[2]}\n"
+
+    # Write to file
+    with open(filename, 'w') as f:
+        f.write(ply_content)
+
+    print(f"✅ Saved {len(valid_points)} points to {filename}")
+
+
+def convert_pi3_to_vggt_format(pi3_output):
+    """Convert Pi3 model output to VGGT-SLAM format."""
+    # Extract outputs (remove batch dimension)
+    points = pi3_output['points'][0]              # (S, H, W, 3)
+    local_points = pi3_output['local_points'][0]  # (S, H, W, 3)
+    conf = torch.sigmoid(pi3_output['conf'][0])   # (S, H, W, 1)
+    camera_poses = pi3_output['camera_poses'][0]  # (S, 4, 4)
+
+    # CRITICAL: Pi3 outputs cam2world, but VGGT expects world2cam (extrinsics)
+    # Also, VGGT expects the first camera to be at identity (origin)
+
+    # Step 1: Get the first camera's cam2world transformation
+    T_c0_to_w = camera_poses[0]  # (4, 4) - first camera to world
+
+    # Step 2: Compute world-to-first-camera transformation (to align world to cam0)
+    # T_w_to_c0 = inv(T_c0_to_w)
+    R_c0_to_w = T_c0_to_w[:3, :3]  # (3, 3)
+    t_c0_to_w = T_c0_to_w[:3, 3:4]  # (3, 1)
+
+    R_w_to_c0 = R_c0_to_w.T  # (3, 3)
+    t_w_to_c0 = -R_w_to_c0 @ t_c0_to_w  # (3, 1)
+
+    T_w_to_c0 = torch.eye(4, dtype=camera_poses.dtype, device=camera_poses.device)
+    T_w_to_c0[:3, :3] = R_w_to_c0
+    T_w_to_c0[:3, 3:4] = t_w_to_c0
+
+    # Step 3: Transform all camera poses to the new world frame (where cam0 is at origin)
+    # T_ci_to_new_world = T_w_to_c0 @ T_ci_to_old_world
+    camera_poses_aligned = T_w_to_c0 @ camera_poses  # (S, 4, 4)
+
+    # Step 4: Convert aligned cam2world to world2cam (extrinsics)
+    R_c2w_aligned = camera_poses_aligned[:, :3, :3]  # (S, 3, 3)
+    t_c2w_aligned = camera_poses_aligned[:, :3, 3:4]  # (S, 3, 1)
+
+    R_w2c = R_c2w_aligned.transpose(-2, -1)  # (S, 3, 3)
+    t_w2c = -R_w2c @ t_c2w_aligned  # (S, 3, 1)
+
+    extrinsics = torch.cat([R_w2c, t_w2c], dim=-1)  # (S, 3, 4)
+
+    # Step 5: Transform world points to the new coordinate frame
+    # points_new = T_w_to_c0 @ points_old (in homogeneous coordinates)
+    S, H, W, _ = points.shape
+    points_flat = points.reshape(-1, 3)  # (S*H*W, 3)
+    points_homo = torch.cat([points_flat, torch.ones(points_flat.shape[0], 1, dtype=points.dtype, device=points.device)], dim=-1)  # (S*H*W, 4)
+    points_aligned_homo = (T_w_to_c0 @ points_homo.T).T  # (S*H*W, 4)
+    points_aligned = points_aligned_homo[:, :3].reshape(S, H, W, 3)  # (S, H, W, 3)
+
+    # Extract depth from local points (z-component)
+    depth = local_points[..., 2:3]  # (S, H, W, 1)
+
+    # Build predictions dict in VGGT-SLAM format
+    # Add batch dimension to match VGGT output format (1, S, ...)
+    predictions = {
+        "world_points": points_aligned.unsqueeze(0),  # Use aligned points
+        "world_points_conf": conf[..., 0].unsqueeze(0),
+        "depth": depth.unsqueeze(0),
+        "depth_conf": conf[..., 0].unsqueeze(0),
+        "extrinsic": extrinsics.unsqueeze(0),
+    }
+    return predictions
 
 def world_to_camera_broadcast(pts_all, extrinsics_c2w):
     """
@@ -177,193 +284,6 @@ def compare_rotations_manual(R1: torch.Tensor, R2: torch.Tensor) -> torch.Tensor
     
     return torch.rad2deg(angle_rad)
 
-
-def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None,
-                           dtype: torch.dtype = None, device: torch.device = None) -> torch.Tensor:
-    """
-    Generate normalized UV coordinates with left-top corner as (-width/diagonal, -height/diagonal)
-    and right-bottom corner as (width/diagonal, height/diagonal).
-
-    Args:
-        width: Image width
-        height: Image height
-        aspect_ratio: Optional aspect ratio (defaults to width/height)
-        dtype: Tensor data type
-        device: Tensor device
-
-    Returns:
-        UV coordinates tensor of shape (H, W, 2)
-    """
-    if aspect_ratio is None:
-        aspect_ratio = width / height
-
-    span_x = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5
-    span_y = 1 / (1 + aspect_ratio ** 2) ** 0.5
-
-    u = torch.linspace(-span_x * (width - 1) / width, span_x * (width - 1) / width, width, dtype=dtype, device=device)
-    v = torch.linspace(-span_y * (height - 1) / height, span_y * (height - 1) / height, height, dtype=dtype, device=device)
-    u, v = torch.meshgrid(u, v, indexing='xy')
-    uv = torch.stack([u, v], dim=-1)
-    return uv
-
-
-def solve_optimal_focal_shift(uv: np.ndarray, xyz: np.ndarray) -> Tuple[float, float]:
-    """
-    Solve `min |focal * xy / (z + shift) - uv|` with respect to shift and focal.
-
-    Args:
-        uv: UV coordinates
-        xyz: 3D points
-
-    Returns:
-        Tuple of (optimal_shift, optimal_focal)
-    """
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    # Data validation: filter out invalid points
-    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
-    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
-    z_valid = np.isfinite(z)                # Z coordinates must be finite
-    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
-
-    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
-
-    # Apply the mask to filter out invalid points
-    uv = uv[valid_mask]
-    xy = xy[valid_mask]
-    z = z[valid_mask]
-
-    # If not enough valid points, return default values
-    if len(uv) < 2:
-        return 0.0, 1.0
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[:, None]
-        f = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-        err = (f * xy_proj - uv).ravel()
-        return err
-
-    try:
-        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    except (ValueError, RuntimeError) as e:
-        # If optimization fails, return default values
-        print(f"Warning: Optimization failed ({e}), using default values")
-        return 0.0, 1.0
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    xy_proj = xy / (z + optim_shift)[:, None]
-    optim_focal = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-
-    return optim_shift, optim_focal
-
-
-def solve_optimal_shift(uv: np.ndarray, xyz: np.ndarray, focal: float) -> float:
-    """
-    Solve `min |focal * xy / (z + shift) - uv|` with respect to shift.
-
-    Args:
-        uv: UV coordinates
-        xyz: 3D points
-        focal: Known focal length
-
-    Returns:
-        Optimal shift value
-    """
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    # Data validation: filter out invalid points
-    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
-    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
-    z_valid = np.isfinite(z)                # Z coordinates must be finite
-    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
-
-    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
-
-    # Apply the mask to filter out invalid points
-    uv = uv[valid_mask]
-    xy = xy[valid_mask]
-    z = z[valid_mask]
-
-    # If not enough valid points, return default value
-    if len(uv) < 2:
-        return 0.0
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[:, None]
-        err = (focal * xy_proj - uv).ravel()
-        return err
-
-    try:
-        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    except (ValueError, RuntimeError) as e:
-        # If optimization fails, return default value
-        print(f"Warning: Optimization failed ({e}), using default value")
-        return 0.0
-
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    return optim_shift
-
-
-def recover_focal_shift(points: torch.Tensor, mask: torch.Tensor = None,
-                       focal: torch.Tensor = None,
-                       downsample_size: Tuple[int, int] = Config.DOWNSAMPLE_SIZE) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Recover the depth map and FoV from a point map with unknown z shift and focal.
-
-    Args:
-        points: Point map tensor of shape (..., H, W, 3)
-        mask: Optional mask tensor
-        focal: Optional focal length tensor
-        downsample_size: Size for downsampling for efficient processing
-
-    Returns:
-        Tuple of (focal, shift) tensors
-    """
-    shape = points.shape
-    height, width = points.shape[-3], points.shape[-2]
-
-    points = points.reshape(-1, *shape[-3:])
-    mask = None if mask is None else mask.reshape(-1, *shape[-3:-1])
-    focal = focal.reshape(-1) if focal is not None else None
-    uv = normalized_view_plane_uv(width, height, dtype=points.dtype, device=points.device)
-
-    # Downsample for efficient processing
-    points_lr = F.interpolate(points.permute(0, 3, 1, 2), downsample_size, mode='nearest').permute(0, 2, 3, 1)
-    uv_lr = F.interpolate(uv.unsqueeze(0).permute(0, 3, 1, 2), downsample_size, mode='nearest').squeeze(0).permute(1, 2, 0)
-    mask_lr = None if mask is None else F.interpolate(mask.to(torch.float32).unsqueeze(1), downsample_size, mode='nearest').squeeze(1) > 0
-
-    # Convert to numpy for optimization
-    uv_lr_np = uv_lr.cpu().numpy()
-    points_lr_np = points_lr.detach().cpu().numpy()
-    focal_np = focal.cpu().numpy() if focal is not None else None
-    mask_lr_np = None if mask is None else mask_lr.cpu().numpy()
-
-    optim_shift, optim_focal = [], []
-    for i in range(points.shape[0]):
-        points_lr_i_np = points_lr_np[i] if mask is None else points_lr_np[i][mask_lr_np[i]]
-        uv_lr_i_np = uv_lr_np if mask is None else uv_lr_np[mask_lr_np[i]]
-
-        if uv_lr_i_np.shape[0] < 2:
-            optim_focal.append(1)
-            optim_shift.append(0)
-            continue
-
-        if focal is None:
-            optim_shift_i, optim_focal_i = solve_optimal_focal_shift(uv_lr_i_np, points_lr_i_np)
-            optim_focal.append(float(optim_focal_i))
-        else:
-            optim_shift_i = solve_optimal_shift(uv_lr_i_np, points_lr_i_np, focal_np[i])
-        optim_shift.append(float(optim_shift_i))
-
-    optim_shift = torch.tensor(optim_shift, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-
-    if focal is None:
-        optim_focal = torch.tensor(optim_focal, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-    else:
-        optim_focal = focal.reshape(shape[:-3])
-
-    return optim_focal, optim_shift
 
 
 def forward_project(image_tensor: torch.Tensor, xyz_grd: torch.Tensor,
@@ -535,7 +455,7 @@ def setup_model() -> Pi3:
     return model
 
 
-def extract_single_sample_results(results: Dict, imgs: torch.Tensor, batch: Dict,
+def extract_single_sample_results(scene: Dict, imgs: torch.Tensor, batch: Dict,
                                 idx: int) -> Tuple[Dict, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract results and data for a single sample from batch results.
@@ -549,10 +469,17 @@ def extract_single_sample_results(results: Dict, imgs: torch.Tensor, batch: Dict
     Returns:
         Tuple of (single_results, single_img, single_grd_mask, single_drone_mask)
     """
-    single_results = {}
-    for key in results.keys():
-        if isinstance(results[key], torch.Tensor):
-            single_results[key] = results[key][idx:idx+1]
+    camera_poses = scene.get_im_poses()  # [V, 4, 4]
+    ref_pose = camera_poses[0][None]  # Reference pose (satellite)
+    camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(ref_pose), camera_poses[None])  # Relative poses to reference
+    points = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(ref_pose), homogenize_points(torch.stack(scene.get_pts3d(), dim=0)[None]))[..., :3]
+
+    single_results = {
+        'points': points,
+        'camera_poses': camera_poses,
+        'focals': scene.get_focals()[0,0] / 512,
+        'conf': torch.stack(scene.get_masks(), dim=0)[None, :, :, :, None],
+    }
 
     single_img = imgs[idx:idx+1]
     single_grd_mask = batch['grd_mask'][idx:idx+1].to(Config.DEVICE).float()
@@ -580,37 +507,13 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     """
     B = single_results['points'].shape[0]
     mask_pts = torch.stack([
-        torch.ones_like(single_grd_mask, device=Config.DEVICE),
         single_grd_mask,
         single_drone_mask
     ], dim=1)
 
     # Transform to reference camera coordinate system
-    reference_cam = single_results['camera_poses'][:, 0]
-    camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), single_results['camera_poses'])
+    camera_poses = single_results['camera_poses']
     pts_all = single_results['points']
-    pts_all = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]
-
-    conf_all = single_results['conf']
-    # Set xyz coordinates to zero for points with confidence in bottom 20%
-    # Flatten confidence values to find threshold
-    conf_flat = conf_all.view(conf_all.shape[0], -1)  # (B, N)
-    conf_threshold = torch.quantile(conf_flat, 0.3, dim=1, keepdim=True)  # Find 30th percentile for each batch
-
-    # Create mask for points with confidence below threshold (bottom 20%)
-    conf_mask = conf_all >= conf_threshold.view(-1, 1, 1, 1, 1)  # (B, V, H, W, 1)
-
-    # Apply mask to point coordinates - set xyz to zero for low confidence points
-    pts_all = pts_all * conf_mask.float() * mask_pts.float()
-
-    # Normalize point cloud
-    dis_all = torch.norm(pts_all, dim=-1).reshape(B, -1)
-    norm_factor = dis_all.sum(dim=[-1]) / ((conf_mask.float() * mask_pts.float()).reshape(B, -1).sum(dim=[-1]) + 1e-5) # [B]
-    
-    pts_all = pts_all / (norm_factor.view(B, 1, 1, 1, 1) + 1e-5)
-    camera_poses[:, :, :3, 3] = camera_poses[:, :, :3, 3] / (norm_factor.view(B, 1, 1) + 1e-5)
-    
-    single_results['camera_poses'] = camera_poses
 
     mask_pts = F.interpolate(rearrange(mask_pts, 'b v h w c -> (b v) c h w'), size=(128, 128), mode='bilinear', align_corners=False)
     mask_pts = rearrange(mask_pts, '(b v) c h w -> b v h w c', b=B)
@@ -637,7 +540,7 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
     ], dim=1)
     extrinsics[:, 3, 3] = 1.0  # 齐次坐标
     pts_gd = world_to_camera_broadcast(pts_gd, extrinsics)
-    pts_gd = pts_gd * mask_pts[:, 1:]
+    pts_gd = pts_gd * mask_pts
     pts_gd = rearrange(pts_gd, 'b v h w c -> b (v h w) c')
     colors_gd = single_img[:, 1:]
     colors_gd = rearrange(colors_gd, 'b v c h w -> b (v h w) c')
@@ -923,26 +826,105 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
         'delta_shift_x': []
     }
 
-    with torch.no_grad():
-        # Prepare input images
-        imgs = torch.stack([batch['sat_pi3'], batch['ground'], batch['drone']], dim=1)
-        imgs = imgs.to(Config.DEVICE)
 
-        # Run model inference
-        results = model(imgs)
+    # Prepare input images
+    imgs = torch.stack([batch['sat_pi3'], batch['ground'], batch['drone']], dim=1)
+    imgs = imgs.to(Config.DEVICE)
 
-        # Process each sample in the batch
-        for i in range(batch_size):
+    # Run model inference
+    # results = model(imgs)
+
+    # Process each sample in the batch
+    for i in range(batch_size):
+
+        imgs_all = [
+            {
+                'img': batch['sat_pi3'][i:i+1].to(Config.DEVICE),
+                'mask': batch['sat_mask'][i:i+1].to(Config.DEVICE),
+                'true_shape': np.array([[518, 518]], dtype=np.int32),
+                'idx': 0,
+                'instance': '0'
+            },
+            {
+                'img': batch['ground'][i:i+1].to(Config.DEVICE),
+                'mask': batch['grd_mask'][i:i+1].to(Config.DEVICE),
+                'true_shape': np.array([[518, 518]], dtype=np.int32),
+                'idx': 1,
+                'instance': '1'
+            },
+            {
+                'img': batch['drone'][i:i+1].to(Config.DEVICE),
+                'mask': batch['drone_mask'][i:i+1].to(Config.DEVICE),
+                'true_shape': np.array([[518, 518]], dtype=np.int32),
+                'idx': 2,
+                'instance': '2'
+            }
+        ]
+
+        output = {
+            'view1':{
+                'img': [],
+                'true_shape': [],
+                'idx': [],
+                'instance': []
+            },
+            'view2':{
+                'img': [],
+                'true_shape': [],
+                'idx': [],
+                'instance': []
+            },
+            'pred1':{
+                'pts3d': None,
+                'conf': None,
+            },
+            'pred2':{
+                'pts3d_in_other_view': None,
+                'conf': None,
+            },
+        }
+
+
+        pairs = make_pairs(imgs_all, scene_graph='complete', prefilter=None, symmetrize=False)
+        for pair in pairs:
+            pair_img = torch.stack([pair[0]['img'], pair[1]['img']], dim=1)
+            # Run model inference
+            with torch.no_grad():
+                results = model(pair_img)
+                predictions = convert_pi3_to_vggt_format(results)
+            
+                output['view1']['img'] = torch.cat((output['view1']['img'], pair[0]['img']), dim=0) if len(output['view1']['img'])>0 else pair[0]['img']
+                output['view1']['true_shape'] = torch.cat((output['view1']['true_shape'], torch.tensor(pair[0]['true_shape']).to(Config.DEVICE)), dim=0) if len(output['view1']['true_shape'])>0 else torch.tensor(pair[0]['true_shape']).to(Config.DEVICE)
+                output['view1']['idx'].append(pair[0]['idx'])
+                output['view1']['instance'].append(pair[0]['instance'])
+                output['view2']['img'] = torch.cat((output['view2']['img'], pair[1]['img']), dim=0) if len(output['view2']['img'])>0 else pair[1]['img']
+                output['view2']['true_shape'] = torch.cat((output['view2']['true_shape'], torch.tensor(pair[1]['true_shape']).to(Config.DEVICE)), dim=0) if len(output['view2']['true_shape'])>0 else torch.tensor(pair[1]['true_shape']).to(Config.DEVICE)
+                output['view2']['idx'].append(pair[1]['idx'])
+                output['view2']['instance'].append(pair[1]['instance'])
+
+                output['pred1']['pts3d'] = predictions['world_points'][0, :1] if output['pred1']['pts3d'] is None else torch.cat((output['pred1']['pts3d'], predictions['world_points'][0, :1]), dim=0)
+                output['pred1']['conf'] = predictions['world_points_conf'][0, :1] if output['pred1']['conf'] is None else torch.cat((output['pred1']['conf'], predictions['world_points_conf'][0, :1]), dim=0)
+                output['pred2']['pts3d_in_other_view'] = predictions['world_points'][0, 1:2] if output['pred2']['pts3d_in_other_view'] is None else torch.cat((output['pred2']['pts3d_in_other_view'], predictions['world_points'][0, 1:2]), dim=0)
+                output['pred2']['conf'] = predictions['world_points_conf'][0, 1:2] if output['pred2']['conf'] is None else torch.cat((output['pred2']['conf'], predictions['world_points_conf'][0, 1:2]), dim=0)
+
+            # colors = rearrange(pair_img, 'b v c h w -> (b v h w) c')
+            # points = rearrange(pts_all, 'b v h w c -> (b v h w) c')
+            # save_points_to_ply(points, colors, 'ground_points.ply')
+
+        scene = global_aligner(output, device=Config.DEVICE, mode=GlobalAlignerMode.PointCloudOptimizer)
+        loss = scene.compute_global_alignment(init="mst", niter=300, schedule='cosine', lr=0.001)
+
+        with torch.no_grad():
             sample_idx = batch['index'][i].item()
             grd_gt_angle_degrees = batch['grd_gt_angle_degrees'][i].item()
             paths = batch['paths']
             # Extract single sample data
             single_results, single_img, single_grd_mask, single_drone_mask, grd_rot, grd_shift_z, grd_shift_x = extract_single_sample_results(
-                results, imgs, batch, i
+                scene, imgs, batch, i
             )
 
             # Reconstruct point cloud
-            pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel = reconstruct_point_cloud(
+            pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel= reconstruct_point_cloud(
                 single_results, single_img, single_grd_mask, single_drone_mask
             )
 
@@ -950,15 +932,14 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
             save_debug_images(single_img, pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel)
 
             # Recover intrinsics from local points
-            points = pts_sat.reshape(1, 128, 128, 3)
-            original_height, original_width = points.shape[-3:-1]
-            aspect_ratio = original_width / original_height
-            width = torch.amax(points[..., 0], dim=(1,2)) - torch.amin(points[..., 0], dim=(1,2))
-            height = torch.amax(points[..., 1], dim=(1,2)) - torch.amin(points[..., 1], dim=(1,2))
+            points = single_results["points"][0, 0]
+            masks = single_results["conf"][0, 0].float()
+            points = points * masks
+            width = torch.amax(points[..., 0], dim=(0,1)) - torch.amin(points[..., 0], dim=(0,1))
+            height = torch.amax(points[..., 1], dim=(0,1)) - torch.amin(points[..., 1], dim=(0,1))
 
             # Recover focal length
-            focal, shift = recover_focal_shift(points)
-            fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+            fx, fy = single_results['focals'], single_results['focals']
             intrinsics = intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
 
             pts_sat = pts_sat.reshape(1, -1, 3)
@@ -970,21 +951,31 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
 
             # Get project grd2sat img
             g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
-            g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
+            g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu().clamp(0,1))
             g2s_img.save('g2s_proj.png')
 
             s2s_direct_proj = project_point_clouds(pts_sat, colors_sat, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
-            s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu())
+            s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu().clamp(0,1))
             s2s_img.save('s2s_proj.png')
 
             sat_ref_img = batch['sat_ref'][i:i+1].to(Config.DEVICE)
-            sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu())
+            sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu().clamp(0,1))
             sat_ref_img.save('sat_ref.png')
 
             # Get image dimensions and project ground camera
             img_width, img_height = imgs[i, 0].shape[-1], imgs[i, 0].shape[-2]
+            reference_cam = single_results['camera_poses'][:, 0]
+            camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), single_results['camera_poses'])
+
+            # Vis Points Cloud
+            # colors = rearrange(single_img, 'b v c h w -> (b v h w) c')
+            # points = rearrange(single_results["points"], 'b v h w c -> (b v h w) c')
+            # masks = colors.any(dim=-1, keepdim=True).float()
+            # points = points * masks
+            # save_points_to_ply(points, colors, 'ground_points.ply')
+
             projection_info, meter_per_pixel = project_ground_camera_to_satellite(
-                single_results['camera_poses'], intrinsics, img_width, img_height, grd_rot, grd_gt_angle_degrees, grd_shift_z, grd_shift_x
+                camera_poses, intrinsics, img_width, img_height, grd_rot, grd_gt_angle_degrees, grd_shift_z, grd_shift_x
             )
 
             # Create coordinate visualization if projection is valid
