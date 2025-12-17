@@ -272,11 +272,11 @@ class BasePCOptimizer (nn.Module):
         return loss
 
     @torch.cuda.amp.autocast(enabled=False)
-    def compute_global_alignment(self, init=None, niter_PnP=10, **kw):
+    def compute_global_alignment(self, init=None, predictions_all=None, niter_PnP=10, **kw):
         if init is None:
             pass
         elif init == 'msp' or init == 'mst':
-            init_minimum_spanning_tree(self, niter_PnP=niter_PnP)
+            init_minimum_spanning_tree(self, predictions_all=predictions_all, niter_PnP=niter_PnP)
         elif init == 'known_poses':
             init_from_known_poses(self, min_conf_thr=self.min_conf_thr,
                                            niter_PnP=niter_PnP)

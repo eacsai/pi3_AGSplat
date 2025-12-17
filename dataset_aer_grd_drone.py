@@ -41,7 +41,7 @@ colmap_to_opencv = np.array([
     [0, 0, 0, 1]
 ], dtype=np.float32)
 
-Rot = False # True是方向对齐，False是不对齐  
+Rot = True # True是方向对齐，False是不对齐  
 
 def get_meter_per_pixel(lat=Default_lat, zoom=Satmap_zoom, scale=SatMap_process_sidelength/SatMap_original_sidelength):
     meter_per_pixel = 156543.03392 * np.cos(lat * np.pi/180.) / (2**zoom)	
@@ -260,17 +260,35 @@ class TestTripletDataset(Dataset):
         grd_mask = Image.open(paths['grd_mask']).convert('L')
         drone_mask = Image.open(paths['drone_mask']).convert('L')
 
-        # Load camera parameters
-        npz_path = paths['ground'].replace('.jpeg.jpg', '.jpeg.npz')
-        npz = np.load(npz_path)
-        cam2world = npz['cam2world']
-        cam2world = colmap_to_opencv @ cam2world
-        cam2world = torch.from_numpy(cam2world.astype(np.float32))
-        ground_cam_trans = cam2world[:3, 3]
-        ground_cam_rot = cam2world[:3, :3]
+        # Load grd camera parameters
+        grd_npz_path = paths['ground'].replace('.jpeg.jpg', '.jpeg.npz')
+        grd_npz = np.load(grd_npz_path)
+        grd_cam2world = grd_npz['cam2world']
+        grd_cam2world = colmap_to_opencv @ grd_cam2world
+        grd_cam2world = torch.from_numpy(grd_cam2world.astype(np.float32))
+        ground_cam_trans = grd_cam2world[:3, 3]
+        ground_cam_rot = grd_cam2world[:3, :3]
+
         # 计算地面相机的朝向角度
         grd_angle_radians = torch.atan2(ground_cam_rot[0, 2], ground_cam_rot[2, 2])
         grd_angle_degrees = torch.rad2deg(grd_angle_radians)
+
+        # Load drone camera parameters
+        drone_npz_path = paths['drone'].replace('.jpeg.jpg', '.jpeg.npz')
+        drone_npz = np.load(drone_npz_path)
+        drone_cam2world = drone_npz['cam2world']
+        drone_cam2world = colmap_to_opencv @ drone_cam2world
+        drone_cam2world = torch.from_numpy(drone_cam2world.astype(np.float32))
+        drone_cam_trans = drone_cam2world[:3, 3]
+        drone_cam_rot = drone_cam2world[:3, :3]
+
+        # 计算无人机相机的朝向角度
+        drone_angle_radians = torch.atan2(drone_cam_rot[0, 2], drone_cam_rot[2, 2])
+        drone_angle_degrees = torch.rad2deg(drone_angle_radians)
+
+        sat_cam2world = torch.eye(4)
+        all_cam2world = torch.stack([sat_cam2world, grd_cam2world, drone_cam2world], dim=0)
+
 
         # 对卫星图进行下采样
         meter_per_pixel = 500 / min(sat_img.size)
@@ -319,7 +337,8 @@ class TestTripletDataset(Dataset):
             'grd_shift_z': -gt_shift_x * 20.0, # m
             'grd_shift_x': gt_shift_y * 20.0, # m
             'paths': paths,
-            'index': idx
+            'index': idx,
+            'all_cam2world': all_cam2world,
         }
 
 

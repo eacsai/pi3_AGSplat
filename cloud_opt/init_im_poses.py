@@ -64,15 +64,24 @@ def init_from_known_poses(self, niter_PnP=10, min_conf_thr=3):
 
 
 @torch.no_grad()
-def init_minimum_spanning_tree(self, **kw):
+def init_minimum_spanning_tree(self, predictions_all, **kw):
     """ Init all camera poses (image-wise and pairwise poses) given
         an initial set of pairwise estimations.
     """
     device = self.device
-    pts3d, _, im_focals, im_poses = minimum_spanning_tree(self.imshapes, self.edges,
-                                                          self.pred_i, self.pred_j, self.conf_i, self.conf_j, self.im_conf, self.min_conf_thr,
-                                                          device, has_im_poses=self.has_im_poses, verbose=self.verbose,
-                                                          **kw)
+    # pts3d, _, im_focals, im_poses = minimum_spanning_tree(self.imshapes, self.edges,
+    #                                                       self.pred_i, self.pred_j, self.conf_i, self.conf_j, self.im_conf, self.min_conf_thr,
+    #                                                       device, has_im_poses=self.has_im_poses, verbose=self.verbose,
+    #                                                       **kw)
+    pts3d = []
+    for i in range(self.n_imgs):
+        pts3d.append(predictions_all['world_points'][0,i])  # list of [H, W, 3]
+    
+    im_focals = []
+    for i in range(self.n_imgs):
+        im_focals.append(predictions_all['intrinsic'][0,i,0,0].item() * 504)  # list of [focal]
+
+    im_poses = predictions_all['extrinsic'][0] #[3, 4, 4]
 
     return init_from_pts3d(self, pts3d, im_focals, im_poses)
 

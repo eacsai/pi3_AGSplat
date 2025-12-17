@@ -5,7 +5,7 @@ This script processes satellite, ground, and drone image triplets to calculate
 the distance from ground camera positions to satellite image centers.
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"  # 指定使用的GPU设备ID
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 指定使用的GPU设备ID
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +22,7 @@ from image_pairs import make_pairs
 # Local imports
 from pi3.models.pi3 import Pi3
 from dataset_aer_grd_drone import load_test_triplet, create_test_dataloader
-from pi3.utils.geometry import intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
+from pi3.utils.geometry import recover_focal_shift, intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
 
 from cloud_opt import global_aligner, GlobalAlignerMode
 # =============================================================================
@@ -39,7 +39,7 @@ class Config:
     DOWNSAMPLE_SIZE = (64, 64)
     CONF_THRESHOLD = 0.1
     MODEL_NAME = "yyfz233/Pi3"
-    OUTPUT_FILE = "ground_camera_distances.txt"
+    OUTPUT_FILE = "ground_camera_distances_pi3_pose.txt"
 
 
 # Transformation matrices and utilities
@@ -104,64 +104,52 @@ def save_points_to_ply(points: torch.Tensor, colors: torch.Tensor, filename: str
     print(f"✅ Saved {len(valid_points)} points to {filename}")
 
 
-def convert_pi3_to_vggt_format(pi3_output):
+def convert_pi3_to_vggt_format(pi3_output, mask_pts=None):
     """Convert Pi3 model output to VGGT-SLAM format."""
     # Extract outputs (remove batch dimension)
-    points = pi3_output['points'][0]              # (S, H, W, 3)
+    B = pi3_output['local_points'].shape[0]
     local_points = pi3_output['local_points'][0]  # (S, H, W, 3)
-    conf = torch.sigmoid(pi3_output['conf'][0])   # (S, H, W, 1)
-    camera_poses = pi3_output['camera_poses'][0]  # (S, 4, 4)
-
-    # CRITICAL: Pi3 outputs cam2world, but VGGT expects world2cam (extrinsics)
-    # Also, VGGT expects the first camera to be at identity (origin)
-
-    # Step 1: Get the first camera's cam2world transformation
-    T_c0_to_w = camera_poses[0]  # (4, 4) - first camera to world
-
-    # Step 2: Compute world-to-first-camera transformation (to align world to cam0)
-    # T_w_to_c0 = inv(T_c0_to_w)
-    R_c0_to_w = T_c0_to_w[:3, :3]  # (3, 3)
-    t_c0_to_w = T_c0_to_w[:3, 3:4]  # (3, 1)
-
-    R_w_to_c0 = R_c0_to_w.T  # (3, 3)
-    t_w_to_c0 = -R_w_to_c0 @ t_c0_to_w  # (3, 1)
-
-    T_w_to_c0 = torch.eye(4, dtype=camera_poses.dtype, device=camera_poses.device)
-    T_w_to_c0[:3, :3] = R_w_to_c0
-    T_w_to_c0[:3, 3:4] = t_w_to_c0
-
-    # Step 3: Transform all camera poses to the new world frame (where cam0 is at origin)
-    # T_ci_to_new_world = T_w_to_c0 @ T_ci_to_old_world
-    camera_poses_aligned = T_w_to_c0 @ camera_poses  # (S, 4, 4)
-
-    # Step 4: Convert aligned cam2world to world2cam (extrinsics)
-    R_c2w_aligned = camera_poses_aligned[:, :3, :3]  # (S, 3, 3)
-    t_c2w_aligned = camera_poses_aligned[:, :3, 3:4]  # (S, 3, 1)
-
-    R_w2c = R_c2w_aligned.transpose(-2, -1)  # (S, 3, 3)
-    t_w2c = -R_w2c @ t_c2w_aligned  # (S, 3, 1)
-
-    extrinsics = torch.cat([R_w2c, t_w2c], dim=-1)  # (S, 3, 4)
-
-    # Step 5: Transform world points to the new coordinate frame
-    # points_new = T_w_to_c0 @ points_old (in homogeneous coordinates)
-    S, H, W, _ = points.shape
-    points_flat = points.reshape(-1, 3)  # (S*H*W, 3)
-    points_homo = torch.cat([points_flat, torch.ones(points_flat.shape[0], 1, dtype=points.dtype, device=points.device)], dim=-1)  # (S*H*W, 4)
-    points_aligned_homo = (T_w_to_c0 @ points_homo.T).T  # (S*H*W, 4)
-    points_aligned = points_aligned_homo[:, :3].reshape(S, H, W, 3)  # (S, H, W, 3)
+    conf = torch.sigmoid(pi3_output['conf'])   # (B, S, H, W, 1)
+    reference_cam = pi3_output['camera_poses'][:, 0]
+    camera_poses = torch.einsum('bij, bnjk -> bnik', se3_inverse(reference_cam), pi3_output['camera_poses'])  # (B, S, 4, 4)
+    pts_all = pi3_output['points']             # (B, S, H, W, 3)
+    pts_all = torch.einsum('bij, bnhwj -> bnhwi', se3_inverse(reference_cam), homogenize_points(pts_all))[..., :3]
+    
+    conf_flat = conf.view(conf.shape[0], -1)  # (B, N)
+    conf_threshold = torch.quantile(conf_flat, 0.3, dim=1, keepdim=True)  # Find 30th percentile for each batch
+    conf_mask = conf >= conf_threshold.view(-1, 1, 1, 1, 1)  # (B, V, H, W, 1)
+    if mask_pts is not None:
+        pts_all = pts_all * conf_mask.float() * mask_pts.float()
+        dis_all = torch.norm(pts_all, dim=-1).reshape(B, -1)  # (B, N)
+        norm_factor = dis_all.sum(dim=[-1]) / ((conf_mask.float() * mask_pts.float()).reshape(B, -1).sum(dim=[-1]) + 1e-5) # [B]
+    else:
+        pts_all = pts_all * conf_mask.float()
+        dis_all = torch.norm(pts_all, dim=-1).reshape(B, -1)  # (B, N)
+        norm_factor = dis_all.sum(dim=[-1]) / ((conf_mask.float()).reshape(B, -1).sum(dim=[-1]) + 1e-5) # [B]
+    
+    pts_all = pts_all / (norm_factor.view(B, 1, 1, 1, 1) + 1e-5)
+    camera_poses[:, :, :3, 3] = camera_poses[:, :, :3, 3] / (norm_factor.view(B, 1, 1) + 1e-5)
 
     # Extract depth from local points (z-component)
     depth = local_points[..., 2:3]  # (S, H, W, 1)
 
+    # Extract Intrinsics
+    # Recover focal length
+    focal, shift = recover_focal_shift(local_points)
+    original_height, original_width = local_points.shape[-3:-1]
+    aspect_ratio = original_width / original_height
+    fx, fy = focal / 2 * (1 + aspect_ratio ** 2) ** 0.5 / aspect_ratio, focal / 2 * (1 + aspect_ratio ** 2) ** 0.5
+    intrinsics = intrinsics_from_focal_center(fx, fy, 0.5, 0.5)
+
     # Build predictions dict in VGGT-SLAM format
     # Add batch dimension to match VGGT output format (1, S, ...)
     predictions = {
-        "world_points": points_aligned.unsqueeze(0),  # Use aligned points
-        "world_points_conf": conf[..., 0].unsqueeze(0),
+        "world_points": pts_all,  # Use aligned points
+        "world_points_conf": conf[..., 0],
         "depth": depth.unsqueeze(0),
-        "depth_conf": conf[..., 0].unsqueeze(0),
-        "extrinsic": extrinsics.unsqueeze(0),
+        "depth_conf": conf[..., 0],
+        "extrinsic": camera_poses,
+        "intrinsic": intrinsics.unsqueeze(0)
     }
     return predictions
 
@@ -488,11 +476,24 @@ def extract_single_sample_results(scene: Dict, imgs: torch.Tensor, batch: Dict,
     grd_shift_z = batch['grd_shift_z'][idx:idx+1].to(Config.DEVICE).float().item()
     grd_shift_x = batch['grd_shift_x'][idx:idx+1].to(Config.DEVICE).float().item()
 
-    return single_results, single_img, single_grd_mask, single_drone_mask, grd_rot, grd_shift_z, grd_shift_x
+    mask_pts = torch.stack([
+        single_grd_mask,
+        single_drone_mask
+    ], dim=1)
+
+    mask_pts = mask_pts[:, :single_img.shape[1] - 1]
+
+    single_img = single_img * rearrange(torch.cat(
+        (torch.ones_like(mask_pts[:, :1], device=mask_pts.device), mask_pts), dim=1
+    ), 'b v h w c -> b v c h w').float()
+
+    return single_results, single_img, mask_pts, grd_rot, grd_shift_z, grd_shift_x
 
 
-def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
-                           single_grd_mask: torch.Tensor, single_drone_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+def reconstruct_point_cloud(single_results: Dict, 
+                            single_img: torch.Tensor,
+                            mask_pts: torch.Tensor,
+                        ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
     Reconstruct point cloud in reference camera coordinate system.
 
@@ -506,10 +507,6 @@ def reconstruct_point_cloud(single_results: Dict, single_img: torch.Tensor,
         Tuple of (pts_sat, colors_sat, meter_per_pixel)
     """
     B = single_results['points'].shape[0]
-    mask_pts = torch.stack([
-        single_grd_mask,
-        single_drone_mask
-    ], dim=1)
 
     # Transform to reference camera coordinate system
     camera_poses = single_results['camera_poses']
@@ -601,32 +598,89 @@ def project_ground_camera_to_satellite(camera_poses: torch.Tensor,
     }
 
     # Project ground camera to satellite view
-    if ground_cam_pos[2] > 0:
-        proj = K @ ground_cam_pos
-        x_norm = proj[0] / (proj[2] + 1e-6)
-        y_norm = proj[1] / (proj[2] + 1e-6)
-        pixel_x = int(x_norm * img_width)
-        pixel_y = int(y_norm * img_height)
+    # 使用Z坐标的绝对值进行投影
+    cam_pos_abs = ground_cam_pos.clone()
+    cam_pos_abs[2] = torch.abs(ground_cam_pos[2]) + 1e-3  # 避免除以零
 
-        meter_x = (pixel_x - center_x) * meter_per_pixel
-        meter_y = (pixel_y - center_y) * meter_per_pixel
+    proj = K @ cam_pos_abs
+    x_norm = proj[0] / (proj[2] + 1e-6)
+    y_norm = proj[1] / (proj[2] + 1e-6)
+    pixel_x = int(x_norm * img_width)
+    pixel_y = int(y_norm * img_height)
 
-        if 0 <= pixel_x < img_width and 0 <= pixel_y < img_height:
-            distance = np.sqrt((meter_x - grd_shift_z)**2 + (meter_y - grd_shift_x)**2)
-            projection_info.update({
-                'valid': True,
-                'delta_x': np.abs(meter_x - grd_shift_z),
-                'delta_y': np.abs(meter_y - grd_shift_x),
-                'pixel_x': pixel_x,
-                'pixel_y': pixel_y,
-                'distance': distance  # Scale to real-world distance(140m for 504px)
-            })
+    meter_x = (pixel_x - center_x) * meter_per_pixel
+    meter_y = (pixel_y - center_y) * meter_per_pixel
+
+    if 0 <= pixel_x < img_width and 0 <= pixel_y < img_height:
+        distance = np.sqrt((meter_x - grd_shift_z)**2 + (meter_y - grd_shift_x)**2)
+        projection_info.update({
+            'valid': True,
+            'delta_x': np.abs(meter_x - grd_shift_z),
+            'delta_y': np.abs(meter_y - grd_shift_x),
+            'pixel_x': pixel_x,
+            'pixel_y': pixel_y,
+            'distance': distance  # Scale to real-world distance(140m for 504px)
+        })
 
     return projection_info, meter_per_pixel
 
 
+def crop_black_borders(image_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Remove pure black borders from an image tensor.
+
+    Args:
+        image_tensor: Input image tensor [C, H, W] or [H, W, C]
+
+    Returns:
+        Cropped image tensor without black borders
+    """
+    # Convert to numpy for easier processing
+    if image_tensor.dim() == 3:
+        if image_tensor.shape[0] == 3:  # CHW format
+            img_np = image_tensor.permute(1, 2, 0).cpu().numpy()
+        else:  # HWC format
+            img_np = image_tensor.cpu().numpy()
+    else:
+        return image_tensor
+
+    # Convert to grayscale for border detection
+    if img_np.shape[2] == 3:  # RGB
+        gray = np.mean(img_np, axis=2)
+    else:
+        gray = img_np[:, :, 0] if img_np.shape[2] > 0 else img_np
+
+    # Find non-black areas (where pixel values are greater than a small threshold)
+    threshold = 0.01  # Small threshold to account for near-black pixels
+    non_black_mask = gray > threshold
+
+    # Find the bounding box of non-black areas
+    if not np.any(non_black_mask):
+        # If image is all black, return as is
+        return image_tensor
+
+    # Get coordinates of non-black pixels
+    coords = np.where(non_black_mask)
+    min_y, max_y = coords[0].min(), coords[0].max()
+    min_x, max_x = coords[1].min(), coords[1].max()
+
+    # Add small padding
+    padding = 0
+    min_y = max(0, min_y - padding)
+    max_y = min(img_np.shape[0], max_y + padding + 1)
+    min_x = max(0, min_x - padding)
+    max_x = min(img_np.shape[1], max_x + padding + 1)
+
+    # Crop the image
+    cropped_img = img_np[min_y:max_y, min_x:max_x, :]
+
+    # Convert back to tensor
+    cropped_tensor = torch.from_numpy(cropped_img).permute(2, 0, 1).to(image_tensor.device)
+
+    return cropped_tensor
+
 def save_debug_images(single_img: torch.Tensor, pts_sat: torch.Tensor, colors_sat: torch.Tensor,
-                     pts_gd: torch.Tensor, colors_gd: torch.Tensor, meter_per_pixel: float):
+                     pts_gd: torch.Tensor, colors_gd: torch.Tensor, meter_per_pixel: float, save_dir: str):
     """
     Save debug images for visualization (optional).
 
@@ -639,28 +693,33 @@ def save_debug_images(single_img: torch.Tensor, pts_sat: torch.Tensor, colors_sa
         meter_per_pixel: Scale factor
     """
     # Project and save ground to satellite view
+    
     pts_gd_s = torch.einsum('ij, bnj -> bni', SAT_TO_OPENCV.to(Config.DEVICE).to(pts_gd.dtype), homogenize_points(pts_gd))[..., :3]
     g2s = forward_project(colors_gd, pts_gd_s, meter_per_pixel=meter_per_pixel, sat_width=Config.SATELLITE_WIDTH)
     test_img = TO_PIL_IMAGE(g2s[0].cpu())
-    test_img.save('g2s.png')
+    test_img.save(f'{save_dir}/g2s.png')
 
-    # Save individual view images
-    for view_idx, view_name in enumerate(['sat', 'grd', 'drone']):
-        test_img = TO_PIL_IMAGE(single_img[0, view_idx].cpu())
-        test_img.save(f'{view_name}.png')
+    img_names = ['sat', 'grd', 'drone'][:single_img.shape[0]]
+
+    # Save individual view images with black borders removed
+    for view_idx, view_name in enumerate(img_names):
+        # Remove black borders from the image
+        cropped_img = crop_black_borders(single_img[view_idx])
+        test_img = TO_PIL_IMAGE(cropped_img.cpu())
+        test_img.save(f'{save_dir}/{view_name}.png')
 
     # Project and save satellite to satellite view
     pts_sat_s = torch.einsum('ij, bnj -> bni', SAT_TO_OPENCV.to(Config.DEVICE).to(pts_sat.dtype), homogenize_points(pts_sat))[..., :3]
     s2s = forward_project(colors_sat, pts_sat_s, meter_per_pixel=meter_per_pixel, sat_width=Config.SATELLITE_WIDTH)
     test_img = TO_PIL_IMAGE(s2s[0].cpu())
-    test_img.save('s2s.png')
+    test_img.save(f'{save_dir}/s2s.png')
 
 
 def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: int,
                                       center_x: int, center_y: int, 
                                       ground_angle_pred: float, ground_angle_gt: float,
                                       sample_idx: int,
-                                      save_dir: str = "coordinate_visualizations"):
+                                      save_dir: str = "coordinate_visualizations_pose"):
     """
     Visualize pixel_x, pixel_y and center_x, center_y coordinates on satellite image,
     including ground camera orientation angle.
@@ -685,24 +744,32 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
 
     # Try to use a larger font, fallback to default if not available
     try:
-        font = ImageFont.truetype("arial.ttf", 16)
+        font = ImageFont.truetype("arial.ttf", 24)
     except:
         try:
             font = ImageFont.load_default()
         except:
             font = None
 
-    # Draw center point (satellite image center) - blue
-    center_size = 8
-    draw.ellipse([(center_x - center_size, center_y - center_size),
-                    (center_x + center_size, center_y + center_size)],
-                fill='blue', outline='white', width=2)
+    # Draw center point (satellite image center) - blue triangle
+    center_size = 10
+    # Calculate triangle vertices (pointing upward)
+    triangle_points = [
+        (center_x, center_y - center_size),  # Top vertex
+        (center_x - center_size, center_y + center_size),  # Bottom left vertex
+        (center_x + center_size, center_y + center_size)   # Bottom right vertex
+    ]
+    draw.polygon(triangle_points, fill='blue', outline='white', width=2)
 
-    # Draw ground camera projection point - red
-    point_size = 6
-    draw.ellipse([(pixel_x - point_size, pixel_y - point_size),
-                    (pixel_x + point_size, pixel_y + point_size)],
-                fill='red', outline='white', width=2)
+    # Draw ground camera projection point - red square
+    point_size = 8
+    square_coords = [
+        (pixel_x - point_size, pixel_y - point_size),  # Top left
+        (pixel_x + point_size, pixel_y - point_size),  # Top right
+        (pixel_x + point_size, pixel_y + point_size),  # Bottom right
+        (pixel_x - point_size, pixel_y + point_size)   # Bottom left
+    ]
+    draw.polygon(square_coords, fill='red', outline='white', width=2)
 
     # Draw line connecting the two points
     draw.line([(center_x, center_y), (pixel_x, pixel_y)],
@@ -719,7 +786,7 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
 
     # Draw the main arrow line
     draw.line([(pixel_x, pixel_y), (arrow_end_x, arrow_end_y)],
-                fill='green', width=3)
+                fill='red', width=3)
 
     # Draw arrowhead
     arrowhead_length = 10
@@ -733,9 +800,9 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
 
     # Draw arrowhead lines
     draw.line([(arrow_end_x, arrow_end_y), (left_x, left_y)],
-                fill='green', width=3)
+                fill='red', width=3)
     draw.line([(arrow_end_x, arrow_end_y), (right_x, right_y)],
-                fill='green', width=3)
+                fill='red', width=3)
 
     # Draw ground truth angle arrow at center position
     # Convert ground truth angle from degrees to radians (clockwise from right direction)
@@ -748,7 +815,7 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
 
     # Draw the ground truth arrow line (orange color to distinguish from predicted)
     draw.line([(center_x, center_y), (gt_arrow_end_x, gt_arrow_end_y)],
-                fill='orange', width=3)
+                fill='blue', width=3)
 
     # Draw ground truth arrowhead
     gt_arrowhead_length = 10
@@ -762,25 +829,25 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
 
     # Draw ground truth arrowhead lines
     draw.line([(gt_arrow_end_x, gt_arrow_end_y), (gt_left_x, gt_left_y)],
-                fill='orange', width=3)
+                fill='blue', width=3)
     draw.line([(gt_arrow_end_x, gt_arrow_end_y), (gt_right_x, gt_right_y)],
-                fill='orange', width=3)
+                fill='blue', width=3)
 
     # Add labels
     if font:
-        draw.text((center_x + 10, center_y - 25), "Center", fill='blue', font=font)
-        draw.text((pixel_x + 10, pixel_y - 25), "Ground Camera", fill='red', font=font)
+        draw.text((center_x + 10, center_y - 25), "GT Camera", fill='blue', font=font)
+        draw.text((pixel_x + 10, pixel_y - 25), "Pred Camera", fill='red', font=font)
 
         # Add orientation labels for both predicted and ground truth angles
         pred_orientation_text_x = arrow_end_x + 10
         pred_orientation_text_y = arrow_end_y - 10
         draw.text((pred_orientation_text_x, pred_orientation_text_y),
-                 f"Pred: {ground_angle_pred:.1f}°", fill='green', font=font)
+                 f"Pred: {ground_angle_pred:.1f}°", fill='red', font=font)
 
         gt_orientation_text_x = gt_arrow_end_x + 10
         gt_orientation_text_y = gt_arrow_end_y - 10
         draw.text((gt_orientation_text_x, gt_orientation_text_y),
-                 f"GT: {ground_angle_gt:.1f}°", fill='orange', font=font)
+                 f"GT: {ground_angle_gt:.1f}°", fill='blue', font=font)
 
         # Add distance and angle information if available
         distance_pixels = np.sqrt((pixel_x - center_x)**2 + (pixel_y - center_y)**2)
@@ -788,8 +855,8 @@ def visualize_coordinates_on_satellite(satellite_image, pixel_x: int, pixel_y: i
         draw.text((10, 10), f"Sample {sample_idx}", fill='white', font=font)
         draw.text((10, 30), f"Distance: {distance_pixels:.1f} px ({distance_meters:.2f} m)",
                     fill='white', font=font)
-        draw.text((10, 50), f"Pred Angle: {ground_angle_pred:.1f}°", fill='green', font=font)
-        draw.text((10, 70), f"GT Angle: {ground_angle_gt:.1f}°", fill='orange', font=font)
+        draw.text((10, 50), f"Pred Angle: {ground_angle_pred:.1f}°", fill='red', font=font)
+        draw.text((10, 70), f"GT Angle: {ground_angle_gt:.1f}°", fill='blue', font=font)
         draw.text((10, 90), "Angles: clockwise from right", fill='white', font=font)
     else:
         # Fallback for drawing text without font
@@ -884,14 +951,14 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
             },
         }
 
-
-        pairs = make_pairs(imgs_all, scene_graph='complete', prefilter=None, symmetrize=False)
-        for pair in pairs:
-            pair_img = torch.stack([pair[0]['img'], pair[1]['img']], dim=1)
-            # Run model inference
-            with torch.no_grad():
+        with torch.no_grad():
+            pairs = make_pairs(imgs_all, scene_graph='complete', prefilter=None, symmetrize=False)
+            for pair in pairs:
+                pair_img = torch.stack([pair[0]['img'], pair[1]['img']], dim=1)
+                # Run model inference
                 results = model(pair_img)
-                predictions = convert_pi3_to_vggt_format(results)
+                mask_pts = torch.stack([pair[0]['mask'], pair[1]['mask']], dim=1)
+                predictions = convert_pi3_to_vggt_format(results, mask_pts=None)
             
                 output['view1']['img'] = torch.cat((output['view1']['img'], pair[0]['img']), dim=0) if len(output['view1']['img'])>0 else pair[0]['img']
                 output['view1']['true_shape'] = torch.cat((output['view1']['true_shape'], torch.tensor(pair[0]['true_shape']).to(Config.DEVICE)), dim=0) if len(output['view1']['true_shape'])>0 else torch.tensor(pair[0]['true_shape']).to(Config.DEVICE)
@@ -907,29 +974,32 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                 output['pred2']['pts3d_in_other_view'] = predictions['world_points'][0, 1:2] if output['pred2']['pts3d_in_other_view'] is None else torch.cat((output['pred2']['pts3d_in_other_view'], predictions['world_points'][0, 1:2]), dim=0)
                 output['pred2']['conf'] = predictions['world_points_conf'][0, 1:2] if output['pred2']['conf'] is None else torch.cat((output['pred2']['conf'], predictions['world_points_conf'][0, 1:2]), dim=0)
 
-            # colors = rearrange(pair_img, 'b v c h w -> (b v h w) c')
-            # points = rearrange(pts_all, 'b v h w c -> (b v h w) c')
-            # save_points_to_ply(points, colors, 'ground_points.ply')
-
+                # colors = rearrange(pair_img, 'b v c h w -> (b v h w) c')
+                # points = rearrange(pts_all, 'b v h w c -> (b v h w) c')
+                # save_points_to_ply(points, colors, 'ground_points.ply')
+            results_all = model(imgs[i:i+1])
+            mask_pts_all = torch.stack([imgs_all[0]['mask'], imgs_all[1]['mask'], imgs_all[2]['mask']], dim=1)
+            predictions_all = convert_pi3_to_vggt_format(results_all, mask_pts=None)
         scene = global_aligner(output, device=Config.DEVICE, mode=GlobalAlignerMode.PointCloudOptimizer)
-        loss = scene.compute_global_alignment(init="mst", niter=300, schedule='cosine', lr=0.001)
+        loss = scene.compute_global_alignment(init="mst", predictions_all=predictions_all, niter=300, schedule='cosine', lr=0.0001)
 
         with torch.no_grad():
             sample_idx = batch['index'][i].item()
             grd_gt_angle_degrees = batch['grd_gt_angle_degrees'][i].item()
             paths = batch['paths']
             # Extract single sample data
-            single_results, single_img, single_grd_mask, single_drone_mask, grd_rot, grd_shift_z, grd_shift_x = extract_single_sample_results(
+            single_results, single_img, mask_pts, grd_rot, grd_shift_z, grd_shift_x = extract_single_sample_results(
                 scene, imgs, batch, i
             )
 
             # Reconstruct point cloud
-            pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel= reconstruct_point_cloud(
-                single_results, single_img, single_grd_mask, single_drone_mask
+            pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel = reconstruct_point_cloud(
+                single_results, single_img, mask_pts
             )
 
+            os.makedirs(f'coordinate_visualizations_pose/test_{sample_idx}/', exist_ok=True)
             # Save debug images (optional)
-            save_debug_images(single_img, pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel)
+            save_debug_images(imgs[i], pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel, save_dir=f'coordinate_visualizations_pose/test_{sample_idx}/')
 
             # Recover intrinsics from local points
             points = single_results["points"][0, 0]
@@ -947,20 +1017,20 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
             # Get project grd2sat img
             g2s_direct_proj = project_point_clouds(torch.cat((pts_gd, pts_sat), dim=1), torch.cat((colors_gd, colors_sat), dim=1), intrinsics, Config.SATELLITE_WIDTH, Config.SATELLITE_WIDTH)
             g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu())
-            g2s_img.save('all2s_proj.png')
+            g2s_img.save(f'coordinate_visualizations_pose/test_{sample_idx}/all2s_proj.png')
 
             # Get project grd2sat img
             g2s_direct_proj = project_point_clouds(pts_gd, colors_gd, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
             g2s_img = TO_PIL_IMAGE(g2s_direct_proj[0].cpu().clamp(0,1))
-            g2s_img.save('g2s_proj.png')
+            g2s_img.save(f'coordinate_visualizations_pose/test_{sample_idx}/g2s_proj.png')
 
             s2s_direct_proj = project_point_clouds(pts_sat, colors_sat, intrinsics, int(Config.SATELLITE_WIDTH * 0.67), int(Config.SATELLITE_WIDTH * 0.67))
             s2s_img = TO_PIL_IMAGE(s2s_direct_proj[0].cpu().clamp(0,1))
-            s2s_img.save('s2s_proj.png')
+            s2s_img.save(f'coordinate_visualizations_pose/test_{sample_idx}/s2s_proj.png')
 
             sat_ref_img = batch['sat_ref'][i:i+1].to(Config.DEVICE)
             sat_ref_img = TO_PIL_IMAGE(sat_ref_img[0].cpu().clamp(0,1))
-            sat_ref_img.save('sat_ref.png')
+            sat_ref_img.save(f'coordinate_visualizations_pose/test_{sample_idx}/sat_ref.png')
 
             # Get image dimensions and project ground camera
             img_width, img_height = imgs[i, 0].shape[-1], imgs[i, 0].shape[-2]
@@ -994,7 +1064,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                     ground_angle_pred=projection_info['grd_angle_degrees'],
                     ground_angle_gt=grd_gt_angle_degrees,
                     sample_idx=sample_idx,
-                    save_dir=f"coordinate_visualizations/sat_pred_{len(results_dict['distances'])}.png"
+                    save_dir=f"coordinate_visualizations_pose/test_{sample_idx}/sat_pred.png"
                 )
 
             # Store results
@@ -1007,16 +1077,16 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
             results_dict['projections'].append(projection_info)
             results_dict['image_sizes'].append((img_width, img_height))
             
-            grd_camera = {
-                'pts_gd': pts_gd,  # [1, N, 3]
-                'intrinsics': intrinsics, # [1, 3, 3]
-                'width': width, # [1]
-                'height': height, # [1]
-            }
-            grd_path = paths['ground'][i].split('/')
-            grd_name = grd_path[-1].replace('.jpeg.jpg', '')
-            drone_path = paths['drone'][i].split('/')
-            drone_name = drone_path[-1].replace('.jpeg.jpg', '')
+            # grd_camera = {
+            #     'pts_gd': pts_gd,  # [1, N, 3]
+            #     'intrinsics': intrinsics, # [1, 3, 3]
+            #     'width': width, # [1]
+            #     'height': height, # [1]
+            # }
+            # grd_path = paths['ground'][i].split('/')
+            # grd_name = grd_path[-1].replace('.jpeg.jpg', '')
+            # drone_path = paths['drone'][i].split('/')
+            # drone_name = drone_path[-1].replace('.jpeg.jpg', '')
             # save_path = os.path.join('/', *grd_path[0:5], 'grd_camera', f'{grd_name}_{drone_name}_grd_camera_500_rot.pt')
             # 如果目录不存在就新建目录
             # os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1154,7 +1224,7 @@ def main():
 
     # Setup model and data
     model = setup_model()
-    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1029.txt', batch_size=Config.BATCH_SIZE, shuffle=False, amount=0.02)
+    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1107.txt', batch_size=Config.BATCH_SIZE, shuffle=False, amount=0.1)
 
     print(f"Dataset contains {len(test_dataloader.dataset)} samples")
     print(f"Processing {len(test_dataloader)} batches")

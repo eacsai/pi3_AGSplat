@@ -1,0 +1,65 @@
+Ground Camera to Satellite Center Distance Analysis
+============================================================
+
+Total samples: 40
+Valid projections: 36
+Success rate: 90.00%
+
+Distance Statistics (pixels):
+  Mean: 11.02 ± 11.35
+  Median: 6.88
+  Min: 0.76
+  Max: 52.18
+
+  Heading Differences (degrees): 34.63
+  Ground Camera Rot Differences (degrees): 26.63
+Delta Shift Z (meters): 7.61
+Delta Shift X (meters): 6.72
+
+Lateral Accuracy:
+  Distance within 1m: 16.67% (pred)
+  Distance within 3m: 33.33% (pred)
+  Distance within 5m: 58.33% (pred)
+
+Longitudinal Accuracy:
+  Distance within 1m: 13.89% (pred)
+  Distance within 3m: 44.44% (pred)
+  Distance within 5m: 63.89% (pred)
+
+Individual Results:
+  Sample 0: 1.88 pixels
+  Sample 1: 13.59 pixels
+  Sample 2: 20.13 pixels
+  Sample 3: 3.62 pixels
+  Sample 4: 14.46 pixels
+  Sample 5: 6.68 pixels
+  Sample 6: 4.18 pixels
+  Sample 7: 4.37 pixels
+  Sample 8: 3.21 pixels
+  Sample 9: 2.38 pixels
+  Sample 10: 4.07 pixels
+  Sample 11: 41.26 pixels
+  Sample 12: 23.61 pixels
+  Sample 13: 7.67 pixels
+  Sample 14: 1.97 pixels
+  Sample 15: 18.28 pixels
+  Sample 16: 12.24 pixels
+  Sample 17: 32.53 pixels
+  Sample 18: 12.23 pixels
+  Sample 19: 21.77 pixels
+  Sample 20: 18.42 pixels
+  Sample 21: 7.93 pixels
+  Sample 22: 3.28 pixels
+  Sample 23: 0.76 pixels
+  Sample 24: 7.07 pixels
+  Sample 25: 5.22 pixels
+  Sample 26: 1.90 pixels
+  Sample 27: 4.67 pixels
+  Sample 28: 8.91 pixels
+  Sample 29: 6.22 pixels
+  Sample 30: 52.18 pixels
+  Sample 31: 10.96 pixels
+  Sample 32: 8.03 pixels
+  Sample 33: 4.99 pixels
+  Sample 34: 4.90 pixels
+  Sample 35: 1.30 pixels

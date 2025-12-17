@@ -5,7 +5,7 @@ This script processes satellite, ground, and drone image triplets to calculate
 the distance from ground camera positions to satellite image centers.
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定使用的GPU设备ID
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 指定使用的GPU设备ID
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +22,7 @@ from einops import einsum, rearrange, repeat
 # Local imports
 from pi3.models.pi3 import Pi3
 from dataset_aer_grd_drone import load_test_triplet, create_test_dataloader
-from pi3.utils.geometry import intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
+from pi3.utils.geometry import recover_focal_shift, intrinsics_from_focal_center, se3_inverse, homogenize_points, depth_edge
 
 
 # =============================================================================
@@ -34,12 +34,12 @@ class Config:
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     BATCH_SIZE = 2
     SATELLITE_WIDTH = 512
-    PIXEL_TO_METER = 0.3  # Conversion factor from pixels to meters
+    PIXEL_TO_METER = 140 / SATELLITE_WIDTH  # Conversion factor from pixels to meters
     METER_PER_PIXEL = 0.2  # Default meter per pixel for projection
     DOWNSAMPLE_SIZE = (64, 64)
     CONF_THRESHOLD = 0.1
     MODEL_NAME = "yyfz233/Pi3"
-    OUTPUT_FILE = "ground_camera_distances.txt"
+    OUTPUT_FILE = "ground_camera_distances_pi3.txt"
 
 
 # Transformation matrices and utilities
@@ -176,194 +176,6 @@ def compare_rotations_manual(R1: torch.Tensor, R2: torch.Tensor) -> torch.Tensor
     angle_rad = 2 * torch.acos(dot_product_clamped)
     
     return torch.rad2deg(angle_rad)
-
-
-def normalized_view_plane_uv(width: int, height: int, aspect_ratio: float = None,
-                           dtype: torch.dtype = None, device: torch.device = None) -> torch.Tensor:
-    """
-    Generate normalized UV coordinates with left-top corner as (-width/diagonal, -height/diagonal)
-    and right-bottom corner as (width/diagonal, height/diagonal).
-
-    Args:
-        width: Image width
-        height: Image height
-        aspect_ratio: Optional aspect ratio (defaults to width/height)
-        dtype: Tensor data type
-        device: Tensor device
-
-    Returns:
-        UV coordinates tensor of shape (H, W, 2)
-    """
-    if aspect_ratio is None:
-        aspect_ratio = width / height
-
-    span_x = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5
-    span_y = 1 / (1 + aspect_ratio ** 2) ** 0.5
-
-    u = torch.linspace(-span_x * (width - 1) / width, span_x * (width - 1) / width, width, dtype=dtype, device=device)
-    v = torch.linspace(-span_y * (height - 1) / height, span_y * (height - 1) / height, height, dtype=dtype, device=device)
-    u, v = torch.meshgrid(u, v, indexing='xy')
-    uv = torch.stack([u, v], dim=-1)
-    return uv
-
-
-def solve_optimal_focal_shift(uv: np.ndarray, xyz: np.ndarray) -> Tuple[float, float]:
-    """
-    Solve `min |focal * xy / (z + shift) - uv|` with respect to shift and focal.
-
-    Args:
-        uv: UV coordinates
-        xyz: 3D points
-
-    Returns:
-        Tuple of (optimal_shift, optimal_focal)
-    """
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    # Data validation: filter out invalid points
-    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
-    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
-    z_valid = np.isfinite(z)                # Z coordinates must be finite
-    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
-
-    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
-
-    # Apply the mask to filter out invalid points
-    uv = uv[valid_mask]
-    xy = xy[valid_mask]
-    z = z[valid_mask]
-
-    # If not enough valid points, return default values
-    if len(uv) < 2:
-        return 0.0, 1.0
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[:, None]
-        f = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-        err = (f * xy_proj - uv).ravel()
-        return err
-
-    try:
-        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    except (ValueError, RuntimeError) as e:
-        # If optimization fails, return default values
-        print(f"Warning: Optimization failed ({e}), using default values")
-        return 0.0, 1.0
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    xy_proj = xy / (z + optim_shift)[:, None]
-    optim_focal = (xy_proj * uv).sum() / np.square(xy_proj).sum()
-
-    return optim_shift, optim_focal
-
-
-def solve_optimal_shift(uv: np.ndarray, xyz: np.ndarray, focal: float) -> float:
-    """
-    Solve `min |focal * xy / (z + shift) - uv|` with respect to shift.
-
-    Args:
-        uv: UV coordinates
-        xyz: 3D points
-        focal: Known focal length
-
-    Returns:
-        Optimal shift value
-    """
-    uv, xy, z = uv.reshape(-1, 2), xyz[..., :2].reshape(-1, 2), xyz[..., 2].reshape(-1)
-
-    # Data validation: filter out invalid points
-    uv_valid = np.isfinite(uv).all(axis=1)  # UV coordinates must be finite
-    xy_valid = np.isfinite(xy).all(axis=1)  # XY coordinates must be finite
-    z_valid = np.isfinite(z)                # Z coordinates must be finite
-    z_nonzero = np.abs(z) > 1e-6           # Z must not be too close to zero to avoid division issues
-
-    valid_mask = uv_valid & xy_valid & z_valid & z_nonzero
-
-    # Apply the mask to filter out invalid points
-    uv = uv[valid_mask]
-    xy = xy[valid_mask]
-    z = z[valid_mask]
-
-    # If not enough valid points, return default value
-    if len(uv) < 2:
-        return 0.0
-
-    def fn(uv: np.ndarray, xy: np.ndarray, z: np.ndarray, shift: np.ndarray):
-        xy_proj = xy / (z + shift)[:, None]
-        err = (focal * xy_proj - uv).ravel()
-        return err
-
-    try:
-        solution = least_squares(partial(fn, uv, xy, z), x0=0, ftol=1e-3, method='lm')
-    except (ValueError, RuntimeError) as e:
-        # If optimization fails, return default value
-        print(f"Warning: Optimization failed ({e}), using default value")
-        return 0.0
-
-    optim_shift = solution['x'].squeeze().astype(np.float32)
-
-    return optim_shift
-
-
-def recover_focal_shift(points: torch.Tensor, mask: torch.Tensor = None,
-                       focal: torch.Tensor = None,
-                       downsample_size: Tuple[int, int] = Config.DOWNSAMPLE_SIZE) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Recover the depth map and FoV from a point map with unknown z shift and focal.
-
-    Args:
-        points: Point map tensor of shape (..., H, W, 3)
-        mask: Optional mask tensor
-        focal: Optional focal length tensor
-        downsample_size: Size for downsampling for efficient processing
-
-    Returns:
-        Tuple of (focal, shift) tensors
-    """
-    shape = points.shape
-    height, width = points.shape[-3], points.shape[-2]
-
-    points = points.reshape(-1, *shape[-3:])
-    mask = None if mask is None else mask.reshape(-1, *shape[-3:-1])
-    focal = focal.reshape(-1) if focal is not None else None
-    uv = normalized_view_plane_uv(width, height, dtype=points.dtype, device=points.device)
-
-    # Downsample for efficient processing
-    points_lr = F.interpolate(points.permute(0, 3, 1, 2), downsample_size, mode='nearest').permute(0, 2, 3, 1)
-    uv_lr = F.interpolate(uv.unsqueeze(0).permute(0, 3, 1, 2), downsample_size, mode='nearest').squeeze(0).permute(1, 2, 0)
-    mask_lr = None if mask is None else F.interpolate(mask.to(torch.float32).unsqueeze(1), downsample_size, mode='nearest').squeeze(1) > 0
-
-    # Convert to numpy for optimization
-    uv_lr_np = uv_lr.cpu().numpy()
-    points_lr_np = points_lr.detach().cpu().numpy()
-    focal_np = focal.cpu().numpy() if focal is not None else None
-    mask_lr_np = None if mask is None else mask_lr.cpu().numpy()
-
-    optim_shift, optim_focal = [], []
-    for i in range(points.shape[0]):
-        points_lr_i_np = points_lr_np[i] if mask is None else points_lr_np[i][mask_lr_np[i]]
-        uv_lr_i_np = uv_lr_np if mask is None else uv_lr_np[mask_lr_np[i]]
-
-        if uv_lr_i_np.shape[0] < 2:
-            optim_focal.append(1)
-            optim_shift.append(0)
-            continue
-
-        if focal is None:
-            optim_shift_i, optim_focal_i = solve_optimal_focal_shift(uv_lr_i_np, points_lr_i_np)
-            optim_focal.append(float(optim_focal_i))
-        else:
-            optim_shift_i = solve_optimal_shift(uv_lr_i_np, points_lr_i_np, focal_np[i])
-        optim_shift.append(float(optim_shift_i))
-
-    optim_shift = torch.tensor(optim_shift, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-
-    if focal is None:
-        optim_focal = torch.tensor(optim_focal, device=points.device, dtype=points.dtype).reshape(shape[:-3])
-    else:
-        optim_focal = focal.reshape(shape[:-3])
-
-    return optim_focal, optim_shift
 
 
 def forward_project(image_tensor: torch.Tensor, xyz_grd: torch.Tensor,
@@ -698,26 +510,29 @@ def project_ground_camera_to_satellite(camera_poses: torch.Tensor,
     }
 
     # Project ground camera to satellite view
-    if ground_cam_pos[2] > 0:
-        proj = K @ ground_cam_pos
-        x_norm = proj[0] / (proj[2] + 1e-6)
-        y_norm = proj[1] / (proj[2] + 1e-6)
-        pixel_x = int(x_norm * img_width)
-        pixel_y = int(y_norm * img_height)
+    # 使用Z坐标的绝对值进行投影
+    cam_pos_abs = ground_cam_pos.clone()
+    cam_pos_abs[2] = torch.abs(ground_cam_pos[2]) + 1e-3  # 避免除以零
 
-        meter_x = (pixel_x - center_x) * meter_per_pixel
-        meter_y = (pixel_y - center_y) * meter_per_pixel
+    proj = K @ cam_pos_abs
+    x_norm = proj[0] / (proj[2] + 1e-6)
+    y_norm = proj[1] / (proj[2] + 1e-6)
+    pixel_x = int(x_norm * img_width)
+    pixel_y = int(y_norm * img_height)
 
-        if 0 <= pixel_x < img_width and 0 <= pixel_y < img_height:
-            distance = np.sqrt((meter_x - grd_shift_z)**2 + (meter_y - grd_shift_x)**2)
-            projection_info.update({
-                'valid': True,
-                'delta_x': np.abs(meter_x - grd_shift_z),
-                'delta_y': np.abs(meter_y - grd_shift_x),
-                'pixel_x': pixel_x,
-                'pixel_y': pixel_y,
-                'distance': distance  # Scale to real-world distance(140m for 504px)
-            })
+    meter_x = (pixel_x - center_x) * meter_per_pixel
+    meter_y = (pixel_y - center_y) * meter_per_pixel
+
+    if 0 <= pixel_x < img_width and 0 <= pixel_y < img_height:
+        distance = np.sqrt((meter_x - grd_shift_z)**2 + (meter_y - grd_shift_x)**2)
+        projection_info.update({
+            'valid': True,
+            'delta_x': np.abs(meter_x - grd_shift_z),
+            'delta_y': np.abs(meter_y - grd_shift_x),
+            'pixel_x': pixel_x,
+            'pixel_y': pixel_y,
+            'distance': distance  # Scale to real-world distance(140m for 504px)
+        })
 
     return projection_info, meter_per_pixel
 
@@ -941,7 +756,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                 results, imgs, batch, i
             )
 
-            # Reconstruct point cloud
+            # Reconstruct point cloud v
             pts_sat, colors_sat, pts_gd, colors_gd, meter_per_pixel = reconstruct_point_cloud(
                 single_results, single_img, single_grd_mask, single_drone_mask
             )
@@ -1003,7 +818,7 @@ def calculate_ground_camera_distance(batch: Dict, model: Pi3) -> Dict[str, List]
                     ground_angle_pred=projection_info['grd_angle_degrees'],
                     ground_angle_gt=grd_gt_angle_degrees,
                     sample_idx=sample_idx,
-                    save_dir=f"coordinate_visualizations/sat_pred_{len(results_dict['distances'])}.png"
+                    save_dir=f"coordinate_visualizations_pi3/sat_pred_0.png"
                 )
 
             # Store results
@@ -1163,7 +978,7 @@ def main():
 
     # Setup model and data
     model = setup_model()
-    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1029.txt', batch_size=Config.BATCH_SIZE, shuffle=False, amount=0.02)
+    test_dataloader = create_test_dataloader(test_file_path='/data/zhongyao/aer-grd-map/test_files_1107.txt', batch_size=Config.BATCH_SIZE, shuffle=False, amount=0.1)
 
     print(f"Dataset contains {len(test_dataloader.dataset)} samples")
     print(f"Processing {len(test_dataloader)} batches")
